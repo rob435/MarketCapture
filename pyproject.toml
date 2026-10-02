@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "market-capture"
+version = "0.1.0"
+description = "Record crypto-perpetual venues' public market data to an hourly tape, ship it off the host, and read it back point-in-time."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+# Recording, packing and the metrics sampler need only these; numpy, polars and
+# google-crc32c are read-side (`read`), and the recorder never imports them.
+dependencies = [
+    "websockets>=13,<18",
+]
+
+[project.optional-dependencies]
+# JSON parsing on the writer thread; the recorder runs without it, slower
+# (`status.json` `fast_json`).
+fast = ["orjson>=3.10,<4"]
+# Bars, quality, block files and the rebuilt book.
+read = [
+    "google-crc32c>=1.5,<2",
+    "numpy>=2.1,<3",
+    "polars>=1.44,<2",
+]
+dev = [
+    "market-capture[fast,read]",
+    "pytest>=8.3,<10",
+    "pytest-xdist>=3.6,<4",
+    "ruff>=0.6,<1",
+    "mypy>=1.11,<3",
+]
+
+[project.scripts]
+market-tape = "market_tape.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["market_tape*"]
+
+[tool.setuptools.package-data]
+market_tape = ["README.md", "examples/*.toml"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["market_tape"]
+ignore_missing_imports = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true

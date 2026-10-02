@@ -1,0 +1,31 @@
+# Everything the venue publishes, for every listed USDT perpetual: the
+# configuration for a machine with unbounded bandwidth and disk. One tier, every
+# feed, 1000-level books at the venue's 300 ms cadence, plus one-minute candles.
+# Bybit publishes about 500 USDT perpetuals; expect several hundred gigabytes a
+# day compressed and size the storage figures to the disk you have.
+schema = 1
+
+[venue]
+name = "bybit"
+market = "linear"
+
+[storage]
+root = "/data/market-tape/bybit-linear"
+segment_max_mb = 256
+retention_days = 3650
+max_disk_gb = 20000
+min_free_disk_gb = 200
+queue_frames = 131072
+
+[connection]
+topics_per_connection = 100
+
+[snapshots]
+cadence = "hour"
+
+# No [budget]: this configuration measures its bytes and sheds nothing.
+
+[[tier]]
+name = "everything"
+feeds = ["book:1000", "book:50", "book:1", "trades", "ticker", "liquidations", "kline:1m"]
+universe = { kind = "listed", quote = "USDT" }

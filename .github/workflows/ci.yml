@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: sudo apt-get install -y zstd
+      - run: pip install -e '.[dev]'
+      - run: ruff check .
+      - run: mypy
+      - run: python -m pytest -n auto
+
+  # The capture host's install: no extras. Recording, packing and the sampler
+  # import nothing beyond `websockets`, and every shipped config checks.
+  record-only:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install .
+      - working-directory: /tmp
+        run: |
+          python - <<'PY'
+          import sys
+          import market_tape.__main__, market_tape.metrics, market_tape.pack, market_tape.record
+          loaded = sorted(name for name in ("google_crc32c", "numpy", "orjson", "polars") if name in sys.modules)
+          assert not loaded, f"the recorder's install imported {loaded}"
+          PY
+      - run: for config in deploy/capture/*.toml market_tape/examples/*.toml; do market-tape check --config "$config" > /dev/null; done

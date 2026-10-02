@@ -1,0 +1,20 @@
+# A first Binance USD-M recording: two names' top of book and prints. The
+# streams flow where `fapi.binance.com` answers 451; `listed` then holds
+# nothing, so this names its symbols.
+#
+#   python -m market_tape record --config market_tape/examples/binance-quickstart.toml --root ./tape-binance
+schema = 1
+
+[venue]
+name = "binance"
+market = "usdm"
+
+[storage]
+retention_days = 7
+max_disk_gb = 5
+min_free_disk_gb = 2
+
+[[tier]]
+name = "majors"
+feeds = ["book:1", "trades"]
+universe = { kind = "symbols", symbols = ["BTCUSDT", "ETHUSDT"] }

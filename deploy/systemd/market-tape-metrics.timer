@@ -1,0 +1,13 @@
+[Unit]
+Description=Sample the market recorders' status once a minute
+
+[Timer]
+# One minute is the resolution of the tape's health curve.
+OnCalendar=*-*-* *:*:20
+AccuracySec=5s
+# A missed minute stays missed. Replaying it would append a sample stamped
+# now for a minute that is over, and the gap is the fact worth keeping.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

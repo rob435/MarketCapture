@@ -1,0 +1,12 @@
+[Unit]
+Description=Hourly packing and upload of finished market-tape hours
+
+[Timer]
+# Ten past the hour: the hour that just ended has had its last segments closed
+# and compressed by then. Persistent so a missed hour ships on the next boot.
+OnCalendar=*-*-* *:10:00 UTC
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,39 @@
+[Unit]
+Description=One sample of each market recorder per minute, kept on the host and pushed to a metrics sink
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+KillMode=control-group
+# One status read, one stamp read, one append, and at most one HTTP POST. A
+# minute timer must never find the previous run still activating.
+TimeoutStartSec=45
+# The recorders' user: their roots are 0750 and their /proc entries visible to it.
+User=market-capture
+Group=market-capture
+WorkingDirectory=/opt/market-capture
+# METRICS_PUSH_URL, METRICS_PUSH_USER, METRICS_PUSH_TOKEN (deploy/metrics.env.example);
+# without the file, or with any of the three empty, samples stay on the host.
+EnvironmentFile=-/etc/market-capture/metrics.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+# One `--status VENUE=PATH` per recorder this host runs; VENUE is the
+# sample's realm label. Drop the line of a recorder you do not run, or it is
+# sampled as absent every minute.
+ExecStart=/opt/market-capture/.venv/bin/python -m market_tape metrics \
+    --status bybit=/var/lib/market-capture/bybit-linear/status.json \
+    --status binance=/var/lib/market-capture/binance-usdm/status.json \
+    --upload-stamp /var/lib/market-capture/receipts/pack.last-success \
+    --state-dir /var/lib/market-capture/metrics
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+StateDirectory=market-capture/metrics
+ReadWritePaths=/var/lib/market-capture/metrics
+MemoryMax=128M
+# An observer must not preempt the recorders it observes (Nice=0).
+Nice=10
+StandardOutput=journal
+StandardError=journal

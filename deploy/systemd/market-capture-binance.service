@@ -1,0 +1,40 @@
+[Unit]
+Description=Binance USD-M market recorder: every listed USDT perpetual's top of book and prints
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=market-capture
+Group=market-capture
+WorkingDirectory=/opt/market-capture
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/market-capture/.venv/bin/python -m market_tape record \
+    --config deploy/capture/binance-usdm.toml \
+    --root /var/lib/market-capture/binance-usdm
+SuccessExitStatus=143
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=600
+
+StateDirectory=market-capture/binance-usdm
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/market-capture/binance-usdm
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectSystem=strict
+ProtectHome=true
+# Twice `queue_max_mb = 512` in deploy/capture/binance-usdm.toml.
+MemoryMax=1G
+LimitNOFILE=65536
+TasksMax=256
+Nice=0
+IOSchedulingClass=best-effort
+
+[Install]
+WantedBy=multi-user.target

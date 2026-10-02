@@ -1,0 +1,76 @@
+# The Binance USD-M market recorder on the capture host. Read by
+# deploy/systemd/market-capture-binance.service, which passes --root;
+# `python -m market_tape check --config deploy/capture/binance-usdm.toml` validates it.
+#
+# The reference venue's tape beside the Bybit one: every listed USDT
+# perpetual's top of book and prints. `book:1` is `<pair>@bookTicker` on
+# `wss://fstream.binance.com/stream`, the URL a live top-of-book reader takes,
+# and `trades` is `<pair>@trade` on the same socket (market_tape/venues/binance.py).
+schema = 1
+
+[venue]
+name = "binance"
+market = "usdm"
+
+[storage]
+# Measured 2026-09-25 (60 s, every USDT name the venue streams): 5,200-5,900
+# rows/s at 423 B of JSON a row, 7.9-9.0 GB raw an hour, which zstd -3 takes to
+# 22.6 B a row: 0.42-0.48 GB an hour on disk and on the box, ~350 GB/month.
+# 16 MB segments hold ~3.6 GB raw open at an hour's end (64 MB would hold
+# 6.2 GB), so the hour roll's compression stays under the compressor's 4 GiB
+# backlog (`compress_backlog_max_mb`); ~1,000 segments an hour, which
+# `market_tape fetch` reads a symbol's run at a time.
+segment_max_mb = 16
+# One buffer per open segment, ~530 of them: 8 MiB at 16 KiB where the default
+# 64 KiB holds 33 MiB. A bookTicker or @trade row is about 0.5 KB.
+segment_buffer_kb = 16
+# Frames are ~200 B, 81 B more queued (the reader's 25 B event header and
+# `record.QUEUE_EVENT_OVERHEAD_BYTES`): the frame bound binds first, at ~0.27 GiB
+# and ~3 minutes of the measured rate.
+queue_frames = 1048576
+# Half of the unit's MemoryMax=1G, as on the Bybit recorder: the reader's
+# socket queues (3 shards x `reader.SOCKET_QUEUE_FRAMES` x ~200 B, ~2.5 MB),
+# its 1 MiB events buffer and pipe, two interpreters and the page cache
+# systemd charges to the unit share the rest.
+queue_max_mb = 512
+fsync_every_records = 20000
+retention_days = 30
+# One disk (96 GB) holds both recorders, and each recorder's
+# `min_free_disk_gb` is the same filesystem's floor, so the caps must sum
+# under what the host leaves them or they race the floor: Bybit 60 + this
+# 16 + the 12 floor = 88 GB. 16 is the open hour's ~3.6 GB raw plus ~27 h
+# of compressed tape: `pack --keep-hours 6` holds six, the rest is an upload
+# stall's headroom before retention deletes unshipped hours, oldest first.
+max_disk_gb = 16
+min_free_disk_gb = 12
+status_interval_seconds = 30
+
+[connection]
+# The venue caps a connection at 1024 streams; ~530 listed names x 2 streams
+# is three connections at 400.
+topics_per_connection = 400
+
+[snapshots]
+# Hourly: `listed` follows exchangeInfo, so a name listed mid-day joins within
+# the hour. Four REST calls an hour.
+cadence = "hour"
+
+[budget]
+# Inbound payload, as the byte meter counts it (frames before JSON parsing;
+# no compression is negotiated), measured 2026-09-25 over 60 s twice:
+#   bookTicker 4,244-4,738 msg/s at 204 B = 868-965 KB/s
+#   trade        954-1,196 msg/s at 167 B = 160-200 KB/s
+#   1.03-1.17 MB/s x 2,592,000 s = 2,660-3,020 GB/month.
+# The allowance is twice that: over it is a sustained doubling of the whole
+# market's quote rate, not a volatile hour. With Bybit's 5,000 both recorders
+# sit well inside the host's 32 TB line. Nothing is shed: the top of book and
+# the prints are the whole reason this recorder runs.
+monthly_gb = 6000
+shed = []
+
+# Every listed USDT perpetual (`status=TRADING`, `contractType=PERPETUAL`:
+# Binance files stocks and commodities as `TRADIFI_PERPETUAL`, outside it).
+[[tier]]
+name = "usdt_perps"
+feeds = ["book:1", "trades"]
+universe = { kind = "listed", quote = "USDT" }

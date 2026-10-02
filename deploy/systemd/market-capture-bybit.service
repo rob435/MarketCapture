@@ -1,0 +1,51 @@
+[Unit]
+Description=Bybit linear market recorder: books, trades, tickers, funding, liquidations, and instrument snapshots
+Wants=network-online.target
+After=network-online.target
+# Never gives up: the recorder is meant to run for months, and a venue outage
+# must not park it in the failed state.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=market-capture
+Group=market-capture
+WorkingDirectory=/opt/market-capture
+Environment=PYTHONDONTWRITEBYTECODE=1
+# The tiers, feeds, and retention are the config file; the recorder itself is
+# the market_tape package.
+ExecStart=/opt/market-capture/.venv/bin/python -m market_tape record \
+    --config deploy/capture/bybit-linear.toml \
+    --root /var/lib/market-capture/bybit-linear
+# 143 is a clean SIGTERM stop.
+SuccessExitStatus=143
+Restart=always
+RestartSec=5
+KillMode=control-group
+# A stop writes the frame queue out before it closes the open segments, raw,
+# for the next start to compress: a full queue is 1,048,576 frames at the
+# writer's ~5,500 rows/s, about 190 s. At 90 s systemd killed a draining stop.
+TimeoutStopSec=600
+
+StateDirectory=market-capture/bybit-linear
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/market-capture/bybit-linear
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectSystem=strict
+ProtectHome=true
+# systemd charges the tape's page cache to this unit. The capture queue's byte
+# bound (`queue_max_mb = 1024` in deploy/capture/bybit-linear.toml, which derives
+# it) is half of this ceiling; socket read-ahead, the process and its write pages
+# share the rest.
+MemoryMax=2G
+LimitNOFILE=65536
+TasksMax=256
+Nice=0
+IOSchedulingClass=best-effort
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+# The off-host store `market_tape pack` uploads to and `fetch` and
+# `rclone:` sources read from, installed as /etc/market-capture/rclone.conf
+# (root, 0600). Any rclone remote serves; pack proves each upload by size and
+# MD5, so the remote must hash: this is an SFTP box running `md5sum`, as a
+# Hetzner Storage Box does. Name the remote here as `--remote-base` names it.
+[storagebox]
+type = sftp
+host = uXXXXXX.your-storagebox.de
+user = uXXXXXX
+port = 23
+key_file = /etc/market-capture/storagebox_ed25519
+shell_type = unix
+md5sum_command = md5sum
+sha1sum_command = sha1sum

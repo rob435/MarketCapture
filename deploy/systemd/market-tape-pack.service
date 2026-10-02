@@ -1,0 +1,54 @@
+[Unit]
+Description=Pack each finished hour of the market tape into one archive and upload it to the storage box
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Root, so it can read and delete under the recorders' 0750 roots; every file
+# it writes there is given the root's owner (market_tape/storage.py::adopt_owner).
+User=root
+Group=root
+WorkingDirectory=/opt/market-capture
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=RCLONE_CONFIG=/etc/market-capture/rclone.conf
+# One run ships every declared tape; a tape with no root yet is skipped.
+# --keep-hours is the local sliding window: a shipped hour's segments are
+# deleted from the recorder's root once it has been over this long. An hour
+# not in the ledger is never deleted here. `storagebox` is the remote's name in
+# the rclone config (deploy/rclone.conf.example).
+ExecStart=/opt/market-capture/.venv/bin/python -m market_tape pack \
+    --tape bybit-linear=/var/lib/market-capture/bybit-linear \
+    --tape binance-usdm=/var/lib/market-capture/binance-usdm \
+    --remote-base storagebox:market-tape \
+    --state-dir /var/lib/market-capture/pack \
+    --stamp-file /var/lib/market-capture/receipts/pack.last-success \
+    --keep-hours 6
+KillMode=control-group
+# No run deadline: an hour's tar grows with the market, and a run killed
+# mid-upload keeps nothing of it, so a deadline one hour cannot meet would fail
+# every run on that hour and stop every hour behind it. Each rclone call has
+# its own deadline instead, an upload's its length at
+# market_tape/pack.py::UPLOAD_FLOOR_BYTES_PER_S, and the upload lock keeps a
+# run from starting while another holds it.
+TimeoutStartSec=infinity
+
+# 0755: the receipts directory holds the stamp (0644,
+# market_tape/pack.py::write_stamp) the metrics sampler reads as market-capture.
+StateDirectory=market-capture/pack market-capture/receipts
+StateDirectoryMode=0755
+# The tape roots are writable so the run can delete the hours it has shipped.
+# A root no recorder has written yet is absent: `-` lets the namespace come up
+# without it and the run skips it.
+ReadWritePaths=/var/lib/market-capture/pack /var/lib/market-capture/receipts -/var/lib/market-capture/bybit-linear -/var/lib/market-capture/binance-usdm
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectSystem=strict
+ProtectHome=true
+MemoryMax=1G
+TasksMax=128
+Nice=15
+IOSchedulingClass=idle

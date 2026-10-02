@@ -1,0 +1,68 @@
+# The Bybit market recorder on the capture host. Read by deploy/systemd/market-capture-bybit.service,
+# which passes --root; `python -m market_tape check --config deploy/capture/bybit-linear.toml`
+# validates it.
+#
+# Unified full-universe crypto capture at 50-level depth: every listed USDT perpetual
+# in the crypto domain (excluding stocks, ETFs, commodities, and forex).
+# Captures the 50-level orderbook, every trade print, ticker (funding, open interest, turnover),
+# liquidations, settled funding and the long/short account ratio for mid-frequency
+# strategy research, backtesting, and replay.
+schema = 1
+
+[venue]
+name = "bybit"
+market = "linear"
+
+[storage]
+segment_max_mb = 64
+# One buffer per open segment, one per listed name: `book:50` rows are 2.5-3 KB;
+# a deeper book needs more (`config.StorageSettings`).
+segment_buffer_kb = 16
+# Frames wait here for the writer, bounded in frames and in bytes; a shard overruns
+# at whichever binds first. Each item counts its payload plus 81 B (the reader's
+# 25 B event header and `record.QUEUE_EVENT_OVERHEAD_BYTES`). On a quiet day
+# (~220 B a frame) the frame bound binds, at ~0.29 GiB; on a volatile day `book:50`
+# snapshots of 3-5 KB reach the byte bound at ~210,000-350,000 frames.
+queue_frames = 1048576
+# From the unit's MemoryMax=2G (2,048 MiB): 1,024 for this queue; ~280 for what the
+# reader process holds for the 14 shards, `reader.SOCKET_QUEUE_FRAMES` (4,096) frames each
+# at up to ~5 KB, with its 1 MiB events buffer and the 1 MiB pipe; ~250 for the two
+# processes' own working sets (two interpreters, a write buffer per open segment,
+# live state, one zstd child; an estimate, `lm_tape_rss_bytes` reads both); and the
+# remaining ~490 for the tape's page cache, which systemd charges to the unit.
+queue_max_mb = 1024
+fsync_every_records = 20000
+retention_days = 30
+max_disk_gb = 60
+min_free_disk_gb = 12
+status_interval_seconds = 30
+
+[connection]
+topics_per_connection = 150
+
+[snapshots]
+# Hourly: the listed universe follows the instruments table, so a name the venue
+# lists mid-day joins within the hour rather than at midnight, and every hour's
+# archive carries a whole-state ticker table for every symbol. Two REST calls an hour.
+cadence = "hour"
+
+[budget]
+# The capture host these figures are sized for has unmetered / 32 TB bandwidth
+# on a 1 Gbps line. The reader offers no permessage-deflate (market_tape/reader.py), so
+# every inbound byte is uncompressed; `lm_recorder_projected_month_gb` reads the pace
+# against this allowance. Empty shed list guarantees no orderbooks or prints are ever
+# dropped.
+monthly_gb = 5000
+shed = []
+
+# Entire Point-In-Time (PIT) crypto perpetual universe: every listed crypto perpetual
+# is continuously recorded with full 50-level book, trades, ticker, and liquidations.
+# "Listed" automatically excludes non-crypto perpetuals (stocks, ETFs, commodities).
+# `funding` and `account_ratio` are REST lanes, not streams: once an hour, three
+# minutes past the boundary the settlements fall on, one paced walk of the
+# universe writes each symbol's settled funding payments and its five-minute
+# long/short account-ratio buckets into that symbol's segment.
+[[tier]]
+name = "crypto_perps"
+feeds = ["book:50", "trades", "ticker", "liquidations", "funding", "account_ratio"]
+universe = { kind = "listed", quote = "USDT" }

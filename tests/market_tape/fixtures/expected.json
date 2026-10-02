@@ -1,0 +1,52 @@
+{
+  "btc_book_depth50": {
+    "best_ask": [
+      78176.4,
+      1.38
+    ],
+    "best_bid": [
+      78176.3,
+      2.755
+    ],
+    "depth_within_10bp": [
+      605757.2554,
+      664012.696
+    ],
+    "last_update_id": 103605614,
+    "rows_applied": 1180,
+    "valid": true
+  },
+  "btc_trade_volume": 0.284,
+  "first_receive_ns": 1788050062351348208,
+  "hours": [
+    "2026-08-30T00"
+  ],
+  "last_receive_ns": 1788050185149576239,
+  "one_second_bars": 145,
+  "rows_by_symbol_kind": {
+    "BTCUSDT": {
+      "orderbook_delta": 1179,
+      "orderbook_snapshot": 140,
+      "public_trade": 28,
+      "ticker": 153
+    },
+    "PENDLEUSDT": {
+      "orderbook_delta": 250,
+      "orderbook_snapshot": 87,
+      "public_trade": 7,
+      "ticker": 56
+    }
+  },
+  "skipped_rows": 0,
+  "span_by_symbol": {
+    "BTCUSDT": [
+      1788050062351348208,
+      1788050115647416375
+    ],
+    "PENDLEUSDT": [
+      1788050062361828990,
+      1788050185149576239
+    ]
+  },
+  "venue": "bybit"
+}

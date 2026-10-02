@@ -1,0 +1,19 @@
+# A first recording on any machine: two names' 50-level book, prints and
+# ticker, a few GB of disk at most.
+#
+#   python -m market_tape record --config market_tape/examples/bybit-quickstart.toml --root ./tape
+schema = 1
+
+[venue]
+name = "bybit"
+market = "linear"
+
+[storage]
+retention_days = 7
+max_disk_gb = 5
+min_free_disk_gb = 2
+
+[[tier]]
+name = "majors"
+feeds = ["book:50", "trades", "ticker"]
+universe = { kind = "symbols", symbols = ["BTCUSDT", "ETHUSDT"] }

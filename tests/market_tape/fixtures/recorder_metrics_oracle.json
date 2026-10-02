@@ -1,0 +1,150 @@
+{
+  "source": "The recorder cases of the sampler contract: each case's status file read at `now_ms`, and the sample line, push line and file name made of it, with the rounding and freshness rules. A Rust sampler of the same status file holds itself to the same cases, so one dashboard series reads either.",
+  "cases": [
+    {
+      "name": "all_fields",
+      "kind": "recorder",
+      "realm": "bybit",
+      "now_ms": 1788000000000,
+      "input": "{\"venue\":\"bybit\",\"recorded_at_ns\":1787999999000000000,\"last_receive_ns\":1787999999500000000,\"received_frames\":12566753,\"written_rows\":13825572,\"dropped_frames\":0,\"disk_dropped_frames\":0,\"malformed_frames\":3,\"queued_frames\":2,\"snapshot_failures\":0,\"free_disk_bytes\":54422888448,\"disk_blocked\":false,\"queue_capacity\":131072,\"budget\":{\"projected_month_gb\":1670.2,\"monthly_gb\":2400.0,\"over\":false,\"shed\":[]},\"shards\":[{\"connected\":true,\"reconnects\":2},{\"connected\":false,\"reconnects\":499},null],\"bytes\":{\"received_24h\":53045936545}}",
+      "sample_json": "{\"budget_over\":0.0,\"bytes_24h\":53045936545.0,\"disk_blocked\":0.0,\"disk_dropped_frames\":0.0,\"dropped_frames\":0.0,\"free_disk_bytes\":54422888448.0,\"kind\":\"recorder\",\"malformed_frames\":3.0,\"monthly_gb\":2400.0,\"projected_month_gb\":1670.2,\"queue_capacity\":131072.0,\"queue_fill\":1.5e-05,\"queued_frames\":2.0,\"realm\":\"bybit\",\"receive_age_ms\":500,\"received_frames\":12566753.0,\"reconnects\":501,\"shards\":2,\"shards_connected\":1,\"shed_feeds\":0,\"snapshot_failures\":0.0,\"state\":\"live\",\"status_age_ms\":1000,\"ts_ms\":1788000000000,\"venue\":\"bybit\",\"written_rows\":13825572.0}",
+      "line_protocol": "lm_recorder,realm=bybit budget_over=0.0,bytes_24h=53045936545.0,disk_blocked=0.0,disk_dropped_frames=0.0,dropped_frames=0.0,free_disk_bytes=54422888448.0,malformed_frames=3.0,monthly_gb=2400.0,projected_month_gb=1670.2,queue_capacity=131072.0,queue_fill=1.5e-05,queued_frames=2.0,receive_age_ms=500.0,received_frames=12566753.0,reconnects=501.0,shards=2.0,shards_connected=1.0,shed_feeds=0.0,snapshot_failures=0.0,status_age_ms=1000.0,up=1.0,written_rows=13825572.0 1788000000000000000",
+      "filename": "recorder-bybit-2026-08.jsonl"
+    },
+    {
+      "name": "queue_byte_bound",
+      "kind": "recorder",
+      "realm": "bybit",
+      "now_ms": 1788000000000,
+      "input": "{\"venue\":\"bybit\",\"recorded_at_ns\":1787999999000000000,\"last_receive_ns\":1787999999500000000,\"received_frames\":12566753,\"written_rows\":13825572,\"dropped_frames\":0,\"disk_dropped_frames\":0,\"malformed_frames\":3,\"queued_frames\":40000,\"snapshot_failures\":0,\"free_disk_bytes\":54422888448,\"disk_blocked\":false,\"queue_capacity\":131072,\"budget\":{\"projected_month_gb\":1670.2,\"monthly_gb\":2400.0,\"over\":false,\"shed\":[]},\"shards\":[{\"connected\":true,\"reconnects\":2},{\"connected\":false,\"reconnects\":499},null],\"bytes\":{\"received_24h\":53045936545},\"queued_bytes\":943718400,\"queue_byte_capacity\":1073741824}",
+      "sample_json": "{\"budget_over\":0.0,\"bytes_24h\":53045936545.0,\"disk_blocked\":0.0,\"disk_dropped_frames\":0.0,\"dropped_frames\":0.0,\"free_disk_bytes\":54422888448.0,\"kind\":\"recorder\",\"malformed_frames\":3.0,\"monthly_gb\":2400.0,\"projected_month_gb\":1670.2,\"queue_capacity\":131072.0,\"queue_fill\":0.878906,\"queued_frames\":40000.0,\"realm\":\"bybit\",\"receive_age_ms\":500,\"received_frames\":12566753.0,\"reconnects\":501,\"shards\":2,\"shards_connected\":1,\"shed_feeds\":0,\"snapshot_failures\":0.0,\"state\":\"live\",\"status_age_ms\":1000,\"ts_ms\":1788000000000,\"venue\":\"bybit\",\"written_rows\":13825572.0}",
+      "line_protocol": "lm_recorder,realm=bybit budget_over=0.0,bytes_24h=53045936545.0,disk_blocked=0.0,disk_dropped_frames=0.0,dropped_frames=0.0,free_disk_bytes=54422888448.0,malformed_frames=3.0,monthly_gb=2400.0,projected_month_gb=1670.2,queue_capacity=131072.0,queue_fill=0.878906,queued_frames=40000.0,receive_age_ms=500.0,received_frames=12566753.0,reconnects=501.0,shards=2.0,shards_connected=1.0,shed_feeds=0.0,snapshot_failures=0.0,status_age_ms=1000.0,up=1.0,written_rows=13825572.0 1788000000000000000",
+      "filename": "recorder-bybit-2026-08.jsonl"
+    },
+    {
+      "name": "missing_optional",
+      "kind": "recorder",
+      "realm": "mainnet",
+      "now_ms": 1788000000000,
+      "input": "{\"recorded_at_ns\":1788000000000000000,\"last_receive_ns\":0,\"shards\":[]}",
+      "sample_json": "{\"budget_over\":null,\"bytes_24h\":null,\"disk_blocked\":0.0,\"disk_dropped_frames\":null,\"dropped_frames\":null,\"free_disk_bytes\":null,\"kind\":\"recorder\",\"malformed_frames\":null,\"monthly_gb\":null,\"projected_month_gb\":null,\"queue_capacity\":null,\"queue_fill\":null,\"queued_frames\":null,\"realm\":\"mainnet\",\"receive_age_ms\":null,\"received_frames\":null,\"reconnects\":0,\"shards\":0,\"shards_connected\":0,\"shed_feeds\":0,\"snapshot_failures\":null,\"state\":\"live\",\"status_age_ms\":0,\"ts_ms\":1788000000000,\"venue\":null,\"written_rows\":null}",
+      "line_protocol": "lm_recorder,realm=mainnet disk_blocked=0.0,reconnects=0.0,shards=0.0,shards_connected=0.0,shed_feeds=0.0,status_age_ms=0.0,up=1.0 1788000000000000000",
+      "filename": "recorder-mainnet-2026-08.jsonl"
+    },
+    {
+      "name": "boundary",
+      "kind": "recorder",
+      "realm": "mainnet",
+      "now_ms": 1788000000000,
+      "input": "{\"recorded_at_ns\":1787999880000000000}",
+      "sample_json": "{\"budget_over\":null,\"bytes_24h\":null,\"disk_blocked\":0.0,\"disk_dropped_frames\":null,\"dropped_frames\":null,\"free_disk_bytes\":null,\"kind\":\"recorder\",\"malformed_frames\":null,\"monthly_gb\":null,\"projected_month_gb\":null,\"queue_capacity\":null,\"queue_fill\":null,\"queued_frames\":null,\"realm\":\"mainnet\",\"receive_age_ms\":null,\"received_frames\":null,\"reconnects\":0,\"shards\":0,\"shards_connected\":0,\"shed_feeds\":0,\"snapshot_failures\":null,\"state\":\"live\",\"status_age_ms\":120000,\"ts_ms\":1788000000000,\"venue\":null,\"written_rows\":null}",
+      "line_protocol": "lm_recorder,realm=mainnet disk_blocked=0.0,reconnects=0.0,shards=0.0,shards_connected=0.0,shed_feeds=0.0,status_age_ms=120000.0,up=1.0 1788000000000000000",
+      "filename": "recorder-mainnet-2026-08.jsonl"
+    },
+    {
+      "name": "stale",
+      "kind": "recorder",
+      "realm": "mainnet",
+      "now_ms": 1788000000000,
+      "input": "{\"recorded_at_ns\":1787999879999000000}",
+      "sample_json": "{\"kind\":\"recorder\",\"realm\":\"mainnet\",\"state\":\"stale\",\"status_age_ms\":120001,\"ts_ms\":1788000000000}",
+      "line_protocol": "lm_recorder,realm=mainnet status_age_ms=120001.0,up=0.0 1788000000000000000",
+      "filename": "recorder-mainnet-2026-08.jsonl"
+    },
+    {
+      "name": "null",
+      "kind": "recorder",
+      "realm": "mainnet",
+      "now_ms": 1788000000000,
+      "input": "{\"recorded_at_ns\":null}",
+      "sample_json": "{\"error\":\"source timestamp is missing, invalid, or in the future\",\"kind\":\"recorder\",\"realm\":\"mainnet\",\"state\":\"unreadable\",\"ts_ms\":1788000000000}",
+      "line_protocol": "lm_recorder,realm=mainnet up=0.0 1788000000000000000",
+      "filename": "recorder-mainnet-2026-08.jsonl"
+    },
+    {
+      "name": "bool",
+      "kind": "recorder",
+      "realm": "mainnet",
+      "now_ms": 1788000000000,
+      "input": "{\"recorded_at_ns\":true}",
+      "sample_json": "{\"error\":\"source timestamp is missing, invalid, or in the future\",\"kind\":\"recorder\",\"realm\":\"mainnet\",\"state\":\"unreadable\",\"ts_ms\":1788000000000}",
+      "line_protocol": "lm_recorder,realm=mainnet up=0.0 1788000000000000000",
+      "filename": "recorder-mainnet-2026-08.jsonl"
+    },
+    {
+      "name": "string",
+      "kind": "recorder",
+      "realm": "mainnet",
+      "now_ms": 1788000000000,
+      "input": "{\"recorded_at_ns\":\"1788000000000000000\"}",
+      "sample_json": "{\"error\":\"source timestamp is missing, invalid, or in the future\",\"kind\":\"recorder\",\"realm\":\"mainnet\",\"state\":\"unreadable\",\"ts_ms\":1788000000000}",
+      "line_protocol": "lm_recorder,realm=mainnet up=0.0 1788000000000000000",
+      "filename": "recorder-mainnet-2026-08.jsonl"
+    },
+    {
+      "name": "negative",
+      "kind": "recorder",
+      "realm": "mainnet",
+      "now_ms": 1788000000000,
+      "input": "{\"recorded_at_ns\":-1}",
+      "sample_json": "{\"error\":\"source timestamp is missing, invalid, or in the future\",\"kind\":\"recorder\",\"realm\":\"mainnet\",\"state\":\"unreadable\",\"ts_ms\":1788000000000}",
+      "line_protocol": "lm_recorder,realm=mainnet up=0.0 1788000000000000000",
+      "filename": "recorder-mainnet-2026-08.jsonl"
+    },
+    {
+      "name": "future",
+      "kind": "recorder",
+      "realm": "mainnet",
+      "now_ms": 1788000000000,
+      "input": "{\"recorded_at_ns\":1788000000001000000}",
+      "sample_json": "{\"error\":\"source timestamp is missing, invalid, or in the future\",\"kind\":\"recorder\",\"realm\":\"mainnet\",\"state\":\"unreadable\",\"ts_ms\":1788000000000}",
+      "line_protocol": "lm_recorder,realm=mainnet up=0.0 1788000000000000000",
+      "filename": "recorder-mainnet-2026-08.jsonl"
+    }
+  ],
+  "rounding": [
+    {
+      "value": 2.675,
+      "digits": 2,
+      "expected": 2.67
+    },
+    {
+      "value": 1.234567885,
+      "digits": 8,
+      "expected": 1.23456788
+    },
+    {
+      "value": 2.5,
+      "digits": 0,
+      "expected": 2.0
+    },
+    {
+      "value": 3.5,
+      "digits": 0,
+      "expected": 4.0
+    },
+    {
+      "value": -2.5,
+      "digits": 0,
+      "expected": -2.0
+    },
+    {
+      "value": 2.675e-06,
+      "digits": 6,
+      "expected": 3e-06
+    },
+    {
+      "value": 1e-07,
+      "digits": 8,
+      "expected": 1e-07
+    },
+    {
+      "value": -0.0,
+      "digits": 6,
+      "expected": -0.0
+    }
+  ],
+  "freshness_limits_ms": {
+    "recorder": 120000
+  }
+}
