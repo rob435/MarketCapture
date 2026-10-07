@@ -358,7 +358,9 @@ class SegmentWriter:
 
 class Manifest:
     """The root's `manifest.jsonl`: a receipt as each file is written, a
-    deletion row as each leaves.
+    deletion row as each leaves. `kinds` are the receipt kinds that name a
+    file the root holds; a store that keeps its own files' receipts in a
+    manifest of this shape names its kinds here.
 
     This process appends under `lock`. `market_tape pack` appends deletion rows
     from its own process, lock or none, and receipts only while it holds the
@@ -369,14 +371,22 @@ class Manifest:
     kept it for the next rewrite to drop.
     """
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, kinds: Iterable[str] = FILE_RECEIPT_KINDS) -> None:
         self.path = root / "manifest.jsonl"
+        self.kinds = tuple(kinds)
         self.lock = threading.Lock()
         self._kept_bytes = 0
         self._closed = False
 
     def append(self, row: Mapping[str, Any]) -> None:
-        payload = _receipt_line(row)
+        self.extend((row,))
+
+    def extend(self, rows: Iterable[Mapping[str, Any]]) -> None:
+        """Every row in one write and one fsync."""
+
+        payload = b"".join(_receipt_line(row) for row in rows)
+        if not payload:
+            return
         with self.lock:
             created = not self.path.exists()
             with self.path.open("ab+") as handle:
@@ -413,7 +423,7 @@ class Manifest:
         """
 
         try:
-            receipts, offset = _live_receipts(self.path)
+            receipts, offset = _live_receipts(self.path, self.kinds)
         except FileNotFoundError:
             return False
         with self.lock:
@@ -422,7 +432,7 @@ class Manifest:
             with self.path.open("rb") as handle:
                 handle.seek(offset)
                 for line in handle:
-                    _fold_receipt(line, receipts, FILE_RECEIPT_KINDS)
+                    _fold_receipt(line, receipts, self.kinds)
                 previous = os.fstat(handle.fileno())
             temporary = self.path.with_name(f".{self.path.name}.compact")
             try:
@@ -469,9 +479,9 @@ def _fold_receipt(line: bytes, receipts: dict[str, dict[str, Any]], kinds: Conta
         receipts.pop(str(row["path"]), None)
 
 
-def _live_receipts(path: Path) -> tuple[dict[str, dict[str, Any]], int]:
-    """The receipts in `path`, up to its last whole line, whose files exist
-    under its directory; and where that line ends."""
+def _live_receipts(path: Path, kinds: Container[str]) -> tuple[dict[str, dict[str, Any]], int]:
+    """The receipts of `kinds` in `path`, up to its last whole line, whose
+    files exist under its directory; and where that line ends."""
 
     receipts: dict[str, dict[str, Any]] = {}
     offset = 0
@@ -481,7 +491,7 @@ def _live_receipts(path: Path) -> tuple[dict[str, dict[str, Any]], int]:
             if offset + len(line) > end or not line.endswith(b"\n"):
                 break
             offset += len(line)
-            _fold_receipt(line, receipts, FILE_RECEIPT_KINDS)
+            _fold_receipt(line, receipts, kinds)
     root = path.parent
     return {name: row for name, row in receipts.items() if (root / name).exists()}, offset
 
@@ -932,11 +942,13 @@ class Compressor:
             time.sleep(0.02)
         self.pending.put(None)
         self.thread.join(max(0.0, deadline - time.monotonic()))
+        left = self.depth() + self.deferred_waiting() + len(self._recovering)
         if self.thread.is_alive():
-            raise RuntimeError(
-                f"tape compressor did not stop within {timeout:g}s; "
-                f"{self.depth() + self.deferred_waiting() + len(self._recovering)} segment(s) left raw for recovery"
-            )
+            raise RuntimeError(f"tape compressor did not stop within {timeout:g}s; {left} segment(s) left raw for recovery")
+        if left:
+            # A deadline that passed before the start's recovery queued what
+            # it found put the stop ahead of those segments.
+            raise RuntimeError(f"tape compressor stopped within {timeout:g}s; {left} segment(s) left raw for recovery")
         waiting = self.deferred_waiting()
         if waiting:
             raise RuntimeError(f"tape compressor stopped with {waiting} segment(s) deferred and left raw for recovery")

@@ -38,6 +38,7 @@ levels, so no precision is lost; the typed rows convert to float.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Union
 
@@ -596,6 +597,22 @@ def _int(obj: Mapping[str, Any], name: str, default: int | None = 0) -> int:
         raise SchemaError(f"{name} is not an integer: {value!r}") from exc
 
 
+def _number(obj: Mapping[str, Any], name: str) -> float:
+    """A number the row's kind always carries: absent, unreadable or not finite
+    is the row's fault, never a zero."""
+
+    value = obj.get(name)
+    if value is None or isinstance(value, bool):
+        raise SchemaError(f"row lacks {name}")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise SchemaError(f"{name} is not a number: {value!r}") from exc
+    if not math.isfinite(number):
+        raise SchemaError(f"{name} is not finite: {value!r}")
+    return number
+
+
 def _levels(raw: Any, name: str) -> tuple[Level, ...]:
     if raw is None:
         return ()
@@ -614,8 +631,9 @@ def _levels(raw: Any, name: str) -> tuple[Level, ...]:
 def parse_row(obj: Mapping[str, Any]) -> Row:
     """One JSON object from the tape as a typed row.
 
-    A row with an unknown kind, or without a venue or symbol, raises; callers
-    decide whether to skip it.
+    A row with an unknown kind, without a venue or symbol, or without a number
+    its kind's constructor always writes (a trade's price, a candle's close)
+    raises `SchemaError`; callers decide whether to skip it.
     """
 
     kind = obj.get("kind")
@@ -657,8 +675,8 @@ def parse_row(obj: Mapping[str, Any]) -> Row:
             local_receive_ts_ns=received,
             exchange_ts_ns=_int(obj, "exchange_ts_ns"),
             trade_id=str(obj.get("trade_id") or ""),
-            price=float(obj.get("price") or 0.0),
-            qty=float(obj.get("qty") or 0.0),
+            price=_number(obj, "price"),
+            qty=_number(obj, "qty"),
             side=side,
             exchange_system_ts_ns=_int(obj, "exchange_system_ts_ns"),
             local_receive_mono_ns=mono,
@@ -671,7 +689,7 @@ def parse_row(obj: Mapping[str, Any]) -> Row:
         for name, value in raw_values.items():
             if name not in TICKER_VALUE_FIELDS:
                 raise SchemaError(f"ticker value outside the contract: {name}")
-            values[name] = int(value) if name in TICKER_INT_FIELDS else float(value)
+            values[name] = _int(raw_values, name, None) if name in TICKER_INT_FIELDS else _number(raw_values, name)
         return TickerRow(
             venue=venue,
             symbol=symbol,
@@ -693,8 +711,8 @@ def parse_row(obj: Mapping[str, Any]) -> Row:
             exchange_system_ts_ns=_int(obj, "exchange_system_ts_ns"),
             exchange_ts_ns=_int(obj, "exchange_ts_ns"),
             position_side=side,
-            qty=float(obj.get("qty") or 0.0),
-            bankruptcy_price=float(obj.get("bankruptcy_price") or 0.0),
+            qty=_number(obj, "qty"),
+            bankruptcy_price=_number(obj, "bankruptcy_price"),
             local_receive_mono_ns=mono,
         )
     if kind == KIND_KLINE:
@@ -706,12 +724,12 @@ def parse_row(obj: Mapping[str, Any]) -> Row:
             exchange_system_ts_ns=_int(obj, "exchange_system_ts_ns"),
             start_ms=_int(obj, "start_ms"),
             end_ms=_int(obj, "end_ms"),
-            open=float(obj.get("open") or 0.0),
-            high=float(obj.get("high") or 0.0),
-            low=float(obj.get("low") or 0.0),
-            close=float(obj.get("close") or 0.0),
-            volume=float(obj.get("volume") or 0.0),
-            turnover=float(obj.get("turnover") or 0.0),
+            open=_number(obj, "open"),
+            high=_number(obj, "high"),
+            low=_number(obj, "low"),
+            close=_number(obj, "close"),
+            volume=_number(obj, "volume"),
+            turnover=_number(obj, "turnover"),
             confirmed=bool(obj.get("confirmed", False)),
             local_receive_mono_ns=mono,
         )
@@ -721,7 +739,7 @@ def parse_row(obj: Mapping[str, Any]) -> Row:
             symbol=symbol,
             local_receive_ts_ns=received,
             funding_time_ms=_int(obj, "funding_time_ms", None),
-            funding_rate=float(obj.get("funding_rate") or 0.0),
+            funding_rate=_number(obj, "funding_rate"),
         )
     if kind == KIND_ACCOUNT_RATIO:
         return AccountRatioRow(
@@ -730,7 +748,7 @@ def parse_row(obj: Mapping[str, Any]) -> Row:
             local_receive_ts_ns=received,
             period=str(obj.get("period") or ""),
             ts_ms=_int(obj, "ts_ms", None),
-            buy_ratio=float(obj.get("buy_ratio") or 0.0),
-            sell_ratio=float(obj.get("sell_ratio") or 0.0),
+            buy_ratio=_number(obj, "buy_ratio"),
+            sell_ratio=_number(obj, "sell_ratio"),
         )
     raise SchemaError(f"unknown row kind {kind!r}")

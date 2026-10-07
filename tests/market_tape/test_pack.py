@@ -256,8 +256,8 @@ def test_an_idle_root_is_finished_by_the_run_and_the_hour_ships(tmp_path: Path) 
     assert result.returncode == 0, result.stderr
     assert not raw.exists()
     assert raw.with_name(raw.name + ".zst").exists()
-    assert f"recovered 1 raw segment(s) under {root.resolve()}" in result.stdout
-    assert "compressed=1 failed=0" in result.stdout
+    assert f"1 raw segment(s) under {root.resolve()}" in result.stdout
+    assert ": compressed=1 failed=0" in result.stdout
     remote_tar = tmp_path / "remote" / "market-capture/market-tape/bybit-linear/2026/09/02/2026-09-02T10Z.tar"
     with tarfile.open(remote_tar) as archive:
         assert set(archive.getnames()) == {
@@ -310,7 +310,42 @@ def test_a_recovery_that_runs_out_of_time_lets_go_of_nothing_it_still_holds(
     assert [thread for thread in threading.enumerate() if thread.name == "tape-compressor"] == []
     assert result["recovered"] == 0
     assert raw.exists(), "the segment stays raw for a later run"
-    assert "did not stop within 0s" in capsys.readouterr().err
+    assert "within 0s; 1 segment(s) left raw for recovery" in capsys.readouterr().err
+
+
+def test_a_recovery_that_queues_its_segments_after_the_stop_says_they_stay_raw(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The deadline can pass while the thread is still naming what the walk
+    found: its stop is then queued ahead of the segments, the thread takes the
+    stop first, and the run must not read as done."""
+
+    from market_tape.storage import Compressor
+
+    recover, start = Compressor._recover, Compressor.start
+
+    def after_the_stop(self: Compressor) -> None:
+        while self.pending.empty():
+            threading.Event().wait(0.01)
+        recover(self)
+
+    def finishing_before_the_check(self: Compressor) -> None:
+        # The thread is done by the time `close` looks, as on a loaded host
+        # where the closing thread is the one descheduled.
+        start(self)
+        join = self.thread.join
+        self.thread.join = lambda timeout=None: join()  # type: ignore[method-assign]
+
+    monkeypatch.setattr(Compressor, "_recover", after_the_stop)
+    monkeypatch.setattr(Compressor, "start", finishing_before_the_check)
+    root = tmp_path / "tape"
+    raw = _raw_segment(root, "2026-09-02", "10", "BTCUSDT", 0)
+
+    result = pack.recover_idle_root(pack.Tape("bybit-linear", root, REMOTE), timeout=0.2, dry_run=False)
+
+    assert result["recovered"] == 0
+    assert raw.exists(), "the segment stays raw for a later run"
+    assert "1 segment(s) left raw for recovery" in capsys.readouterr().err
 
 
 def test_a_dry_run_names_what_it_would_recover(tmp_path: Path) -> None:

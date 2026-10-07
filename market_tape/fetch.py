@@ -12,8 +12,8 @@ consecutive segments.
 
 ```text
 python -m market_tape fetch --remote-base REMOTE --plan PATH|- --root TAPE=DIR [--root ...]
-    --state-dir DIR [--keep-hours N] [--owner USER:GROUP] [--timeout SECONDS]
-    [--max-stream-bytes N] [--bwlimit-kibps N] [--rclone PATH]
+    --state-dir DIR [--keep-hours N] [--keep-hours-tape TAPE=N ...] [--owner USER:GROUP]
+    [--timeout SECONDS] [--max-stream-bytes N] [--bwlimit-kibps N] [--rclone PATH]
 ```
 
 `--bwlimit-kibps` hands every rclone call `--bwlimit=<N>K --buffer-size=0
@@ -44,8 +44,13 @@ fsync, rename; directories 0750, files 0640, chowned to `--owner`) and
 recorded in `<state-dir>/fetched-members.jsonl`; a member on disk at the
 index's size whose SHA-256 that ledger holds is not read again. An index is
 kept in `<state-dir>/indexes/` and read from there on later runs, until a
-member it names fails. `--keep-hours` deletes each root's hours that ended
-longer ago than that, with their ledger rows and kept indexes.
+member it names fails, or a planned symbol it lacks finds the box's tar at
+another size than it describes: the hour was packed again with more symbols,
+as a tape converted from another source can be when a later plan wants
+another of its symbols.
+`--keep-hours` deletes each root's hours that ended longer ago than that,
+with their ledger rows and kept indexes; `--keep-hours-tape TAPE=N` sets one
+tape's window apart.
 
 Stdout is one JSON line: `{"fetched", "skipped", "failed", "bytes"}` count
 members (a `failed` hour that never listed its members counts one),
@@ -516,6 +521,7 @@ class Fetch:
         disk: Disk,
         max_stream_bytes: int = DEFAULT_MAX_STREAM_BYTES,
         keep_hours: float | None = None,
+        keep_hours_by_tape: Mapping[str, float] | None = None,
         now: float | None = None,
     ) -> None:
         self.remote_base = remote_base.rstrip("/")
@@ -526,6 +532,7 @@ class Fetch:
         self.disk = disk
         self.max_stream_bytes = max_stream_bytes
         self.keep_hours = keep_hours
+        self.keep_hours_by_tape = dict(keep_hours_by_tape or {})
         self.now = time.time() if now is None else now
         self.ledger_path = state_dir / LEDGER_NAME
         self.ledger: dict[tuple[str, str], str] = {}
@@ -568,24 +575,23 @@ class Fetch:
 
     # ------------------------------------------------------------- prune
 
-    def past_window(self, day: str, hour: str) -> bool:
-        if self.keep_hours is None:
+    def past_window(self, tape: str, day: str, hour: str) -> bool:
+        keep = self.keep_hours_by_tape.get(tape, self.keep_hours)
+        if keep is None:
             return False
         end = datetime.fromisoformat(day).replace(tzinfo=timezone.utc).timestamp() + (int(hour) + 1) * 3600.0
-        return self.now >= end + self.keep_hours * 3600.0
+        return self.now >= end + keep * 3600.0
 
     def prune(self) -> int:
-        """Delete every root's hours past `--keep-hours`, their ledger rows and kept indexes; the hours deleted."""
+        """Delete every root's hours past its window, their ledger rows and kept indexes; the hours deleted."""
 
-        if self.keep_hours is None:
-            return 0
         gone: set[tuple[str, str]] = set()
         for tape, root in self.roots.items():
             if not root.is_dir():
                 continue
             for day_dir in sorted(path for path in root.iterdir() if path.is_dir() and DAY_RE.match(path.name)):
                 for hour_dir in sorted(path for path in day_dir.iterdir() if path.is_dir() and HOUR_RE.match(path.name)):
-                    if self.past_window(day_dir.name, hour_dir.name):
+                    if self.past_window(tape, day_dir.name, hour_dir.name):
                         shutil.rmtree(hour_dir)
                         gone.add((tape, f"{day_dir.name}/{hour_dir.name}/"))
                 try:
@@ -595,7 +601,7 @@ class Fetch:
         cache = self.state_dir / INDEX_CACHE
         for kept in sorted(cache.glob(f"*/*{INDEX_SUFFIX}")) if cache.is_dir() else []:
             match = re.match(r"^(\d{4}-\d{2}-\d{2})T(\d{2})Z\.tar", kept.name)
-            if match and self.past_window(match.group(1), match.group(2)):
+            if match and self.past_window(kept.parent.name, match.group(1), match.group(2)):
                 kept.unlink(missing_ok=True)
         if gone:
             self._compact(gone)
@@ -640,7 +646,7 @@ class Fetch:
         return reports
 
     def _hour(self, planned: PlannedHour, report: HourReport) -> None:
-        if self.past_window(planned.day, planned.hour):
+        if self.past_window(planned.tape, planned.day, planned.hour):
             report.status, report.reason = STATUS_SKIPPED, "past_keep_hours"
             return
         root = self.roots.get(planned.tape)
@@ -652,11 +658,20 @@ class Fetch:
         cached = self.state_dir / INDEX_CACHE / planned.tape / f"{planned.name}.tar{INDEX_SUFFIX}"
         members: list[Member] | None = None
         if cached.is_file():
+            kept: Any = None
             try:
-                members = parse_index(json.loads(cached.read_bytes()), planned)
+                kept = json.loads(cached.read_bytes())
+                members = parse_index(kept, planned)
             except ValueError as exc:
                 _say(f"{planned.tape} {planned.name}: the kept index is refused ({exc}); reading the box's")
                 cached.unlink(missing_ok=True)
+            # A planned symbol the kept index lacks: the hour may have been packed again with it.
+            if members is not None and not planned.symbols <= {member.symbol for member in members}:
+                listing = self._listing(planned)
+                size = (listing or {}).get(f"{planned.name}.tar")
+                if size is not None and size != kept["tar_bytes"]:
+                    members = None
+                    cached.unlink(missing_ok=True)
         if members is None:
             listing = self._listing(planned)
             if listing is None or f"{planned.name}.tar" not in listing:
@@ -881,6 +896,20 @@ def parse_roots(texts: list[str]) -> dict[str, Path]:
     return roots
 
 
+def parse_keep_hours(texts: list[str]) -> dict[str, float]:
+    keep: dict[str, float] = {}
+    for text in texts:
+        tape, separator, hours = text.partition("=")
+        try:
+            value = float(hours)
+        except ValueError:
+            value = -1.0
+        if not separator or not TAPE_RE.match(tape) or value < 0:
+            raise UsageError(f"--keep-hours-tape wants TAPE=N with N zero or more, got {text!r}")
+        keep[tape] = value
+    return keep
+
+
 def read_plan(text: str) -> list[PlannedHour]:
     try:
         raw = sys.stdin.read() if text == "-" else Path(text).read_text(encoding="utf-8")
@@ -899,6 +928,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", action="append", default=[], help="TAPE=DIR, where a tape's hours land; repeat per tape")
     parser.add_argument("--state-dir", type=Path, required=True, help="the fetched-member ledger, kept indexes and lock")
     parser.add_argument("--keep-hours", type=float, default=None, help="delete local hours that ended longer ago than this")
+    parser.add_argument(
+        "--keep-hours-tape", action="append", default=[], help="TAPE=N: that tape's window instead of --keep-hours; repeat per tape"
+    )
     parser.add_argument("--owner", default=None, help="USER:GROUP that owns what the fetch writes")
     parser.add_argument(
         "--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS, help="seconds the whole run may take; what is left is reported"
@@ -946,6 +978,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.bwlimit_kibps is not None and args.bwlimit_kibps <= 0:
             raise UsageError(f"--bwlimit-kibps must be a positive whole number of KiB/s, got {args.bwlimit_kibps}")
         roots = parse_roots(args.root)
+        keep_by_tape = parse_keep_hours(args.keep_hours_tape)
         disk = Disk(resolve_owner(args.owner))
         plan = read_plan(args.plan)
         args.state_dir.mkdir(parents=True, exist_ok=True, mode=0o750)
@@ -965,6 +998,7 @@ def main(argv: list[str] | None = None) -> int:
         disk=disk,
         max_stream_bytes=args.max_stream_bytes,
         keep_hours=args.keep_hours,
+        keep_hours_by_tape=keep_by_tape,
         now=args.now,
     )
     pruned = 0

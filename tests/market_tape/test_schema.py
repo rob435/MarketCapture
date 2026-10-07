@@ -96,6 +96,38 @@ def test_a_row_needs_a_kind_a_venue_a_symbol_and_a_receive_clock() -> None:
         parse_row({key: value for key, value in base.items() if key != "local_receive_ts_ns"})
 
 
+@pytest.mark.parametrize(
+    ("kind", "fields", "dropped"),
+    [
+        ("public_trade", {"side": "Buy", "price": 1.5, "qty": 2.0}, "price"),
+        ("public_trade", {"side": "Buy", "price": 1.5, "qty": 2.0}, "qty"),
+        ("liquidation", {"position_side": "Sell", "qty": 2.0, "bankruptcy_price": 1.5}, "bankruptcy_price"),
+        ("kline", {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 3.0, "turnover": 4.0}, "low"),
+        ("funding_settlement", {"funding_time_ms": 1, "funding_rate": 0.0001}, "funding_rate"),
+        ("account_ratio", {"ts_ms": 1, "period": "5min", "buy_ratio": 0.6, "sell_ratio": 0.4}, "sell_ratio"),
+    ],
+)
+def test_a_number_a_row_always_carries_is_never_read_as_zero(kind: str, fields: dict, dropped: str) -> None:
+    """A trade without a price once read as a print at 0.0, which `bars` took
+    as the minute's low; the row is the tape's fault and is refused."""
+
+    base = {"kind": kind, "venue": "bybit", "symbol": "AGIUSDT", "local_receive_ts_ns": 1, **fields}
+    parse_row(base)
+    with pytest.raises(SchemaError, match=f"lacks {dropped}"):
+        parse_row({key: value for key, value in base.items() if key != dropped})
+    for unreadable in ("x", float("nan"), float("inf")):
+        with pytest.raises(SchemaError, match=dropped):
+            parse_row(dict(base, **{dropped: unreadable}))
+
+
+def test_an_unreadable_ticker_value_is_a_schema_error() -> None:
+    base = {"kind": "ticker", "venue": "bybit", "symbol": "AGIUSDT", "local_receive_ts_ns": 1}
+    with pytest.raises(SchemaError, match="mark_price"):
+        parse_row(dict(base, values={"mark_price": "x"}))
+    with pytest.raises(SchemaError, match="next_funding_time_ms"):
+        parse_row(dict(base, values={"next_funding_time_ms": "soon"}))
+
+
 def test_a_settled_funding_payment_and_an_account_ratio_bucket_round_trip() -> None:
     from market_tape.schema import (
         KIND_ACCOUNT_RATIO,

@@ -29,6 +29,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import select
 import shutil
 import socket as sockets
@@ -385,10 +386,14 @@ def test_a_link_the_venue_ends_says_how_and_what_the_reader_held(
                 "frames held for the recorder: 1, the kernel's longest hold of a read since the last stats: 0 ms"
             ]
         else:
-            assert said == [
-                "shard 7 the venue closed the connection (end of stream); "
-                "frames held for the recorder: 1, the kernel's longest hold of a read since the last stats: 0 ms"
-            ]
+            # The hang-up is a read of its own: a pass stops at the short read
+            # that carried the frame, so whether the frame was handed on before
+            # the next pass read the end is the scheduler's.
+            assert len(said) == 1 and re.fullmatch(
+                r"shard 7 the venue closed the connection \(end of stream\); "
+                r"frames held for the recorder: [01], the kernel's longest hold of a read since the last stats: 0 ms",
+                said[0],
+            ), said
         assert driver.payloads() == [b'{"n":1}']
     finally:
         driver.stop()

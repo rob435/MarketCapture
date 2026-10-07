@@ -1145,8 +1145,8 @@ def test_what_lands_while_the_manifest_is_rewritten_stays_in_it(tmp_path: Path, 
     compressed = "2027-01-15/11/AGIUSDT/segment-000000.jsonl.zst"
     walk = storage._live_receipts
 
-    def meanwhile(path: Path) -> tuple[dict[str, dict[str, Any]], int]:
-        found = walk(path)
+    def meanwhile(path: Path, kinds: Any) -> tuple[dict[str, dict[str, Any]], int]:
+        found = walk(path, kinds)
         # The compressor receipts a segment it just finished.
         manifest.append(_on_disk(tmp_path, compressed))
         # `pack` ships an hour: the file goes, then its row, appended as `append_ledger` does.

@@ -329,3 +329,22 @@ def test_a_lane_feed_with_no_topic_is_complete_while_the_recorder_is_up(tmp_path
     assert [(reason.code, reason.from_ns, reason.to_ns) for reason in funding.reasons] == [
         ("recorder_down", BASE_NS + HOUR_NS, late)
     ]
+
+
+def test_a_root_of_a_venue_no_adapter_records_reads_its_coverage(tmp_path: Path) -> None:
+    """A root converted from another source keeps the layout and one coverage
+    record an hour, and may name a venue no adapter here records: its records
+    carry no shard or disconnect, so its cells are read without a topic."""
+
+    root = tmp_path / "okx-swap"
+    root.mkdir()
+    fold = CoverageFold(
+        venue="okx", market="swap", pid=4242, started_at_ns=BASE_NS, feeds={"deep": ("trades",)}, now_ns=BASE_NS
+    )
+    fold.members("deep", ["XUSDT"], BASE_NS)
+    CoverageRecords(root, Manifest(root)).write(fold.roll(BASE_NS + HOUR_NS))
+    _segment(root, "XUSDT", BASE_NS + MINUTE_NS)
+
+    (cell,) = build_ledger(HostRoot(root), [HOUR]).cells
+
+    assert (cell.symbol, cell.feed, cell.status, cell.records) == ("XUSDT", "trades", "complete", 3)

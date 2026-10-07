@@ -904,8 +904,8 @@ class Reader:
             # Each link's frames are already in arrival order; merged on the
             # monotonic stamp they reach the recorder, and the tape, as the host
             # received them. Handed over a link at a time they would trail each
-            # other by up to a pass: tens of milliseconds on a busy reference
-            # feed, every one a row behind the row before it. The merge takes the
+            # other by up to a pass: tens of milliseconds on a busy feed, every
+            # one a row behind the row before it. The merge takes the
             # earliest of the links' next frames by `(mono, wall, link)`, and with
             # it the frames behind it on its link that share its stamps.
             taken = [0] * len(ready)

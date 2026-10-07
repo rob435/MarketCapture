@@ -19,6 +19,8 @@ holds each:
 | a read runs at the line's full rate, queueing the host's market data behind it | `test_a_capped_run_hands_every_rclone_call_the_cap` |
 | a bad invocation runs anyway, or prints a summary | `test_a_run_that_cannot_start_exits_2_and_prints_nothing` |
 | an index names a path outside the tape layout; an index lies about the tar | `test_an_index_cannot_write_outside_the_tape_or_past_the_tar` |
+| an hour packed again with another symbol is never read past its kept index | `test_a_kept_index_lacking_a_planned_symbol_is_read_again_once_its_hour_is_packed_again` |
+| one tape's late hours are deleted on another tape's window | `test_a_tape_keeps_its_own_window` |
 """
 
 from __future__ import annotations
@@ -522,3 +524,74 @@ def test_two_tapes_fetch_newest_hour_first_into_their_own_roots(tmp_path: Path) 
     binance = tmp_path / "local" / "binance-usdm" / DAY / "13" / "BTCUSDT" / "segment-000000.jsonl.zst"
     assert binance.read_bytes() == b"binance-13"
     assert hashlib.sha256(binance.read_bytes()).hexdigest() in (tmp_path / "local" / ".state" / "fetched-members.jsonl").read_text()
+
+
+def _repack(tmp_path: Path, files: dict[str, bytes], tape: str = "bybit-linear") -> None:
+    """The hour packed again whole and laid over the box's, as a writer that
+    converts another source's tape packs an hour it adds symbols to."""
+
+    from market_tape.pack import Candidate, build_archive, build_index
+
+    root = tmp_path / "repacked"
+    shutil.rmtree(root, ignore_errors=True)
+    _hour(root, files)
+    candidate = Candidate(f"{DAY}T{HOUR}Z", DAY, HOUR, (root / DAY / HOUR,))
+    archive, manifest = build_archive(candidate, root, tmp_path / "staging", {}, tape=tape)
+    index, _ = build_index(archive, manifest, tape=tape)
+    box = _box_tar(tmp_path, tape)
+    box.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(archive, box)
+    shutil.copyfile(index, box.with_name(box.name + ".index.json"))
+
+
+def test_a_kept_index_lacking_a_planned_symbol_is_read_again_once_its_hour_is_packed_again(tmp_path: Path) -> None:
+    """A converted tape packs an hour again when a later plan needs another
+    symbol of it; a kept index that never learns of it leaves that symbol
+    `missing` until the window deletes the hour."""
+
+    btc = {"BTCUSDT/segment-000000.jsonl.zst": os.urandom(2_000), COVERAGE: os.urandom(100)}
+    _repack(tmp_path, btc)
+    plan = _plan(tmp_path, _wanted(["BTCUSDT", "ETHUSDT"]))
+    _done, first = _fetch(tmp_path, plan)
+    assert (first["fetched"], first["hours"][0]["missing"]) == (2, ["ETHUSDT"])
+
+    # Not packed again: the kept index stands, at the cost of one listing.
+    before = len((tmp_path / "rclone.log").read_text().splitlines())
+    _done, same = _fetch(tmp_path, plan)
+    calls = (tmp_path / "rclone.log").read_text().splitlines()[before:]
+    assert (same["fetched"], same["hours"][0]["missing"]) == (0, ["ETHUSDT"])
+    assert [call.split()[0] for call in calls] == ["lsjson"], calls
+
+    eth = {"ETHUSDT/segment-000000.jsonl.zst": os.urandom(3_000), COVERAGE: os.urandom(120)}
+    _repack(tmp_path, {**btc, **eth})
+    _done, again = _fetch(tmp_path, plan)
+    assert (again["fetched"], again["skipped"], again["hours"][0]["missing"]) == (2, 1, [])
+    for relative, payload in {**btc, **eth}.items():
+        assert _local(tmp_path, relative).read_bytes() == payload, relative
+
+
+def test_a_tape_keeps_its_own_window(tmp_path: Path) -> None:
+    """A converted tape's hours arrive a day late and are read for weeks; the
+    recorder's window would delete them before their reader read them."""
+
+    _repack(tmp_path, {"BTCUSDT/segment-000000.jsonl.zst": b"converted", COVERAGE: b"c"}, tape="bybit-linear-converted")
+    _hour(tmp_path / "local" / "bybit-linear", {"BTCUSDT/segment-000000.jsonl.zst": b"recorder"})
+    plan = _plan(tmp_path, {"bybit-linear-converted": [{"day": DAY, "hour": HOUR, "symbols": ["BTCUSDT"]}]})
+    converted_root = tmp_path / "local" / "bybit-linear-converted"
+
+    # Two days on: past the default window, inside the converted tape's.
+    _done, summary = _fetch(
+        tmp_path, plan, "--root", f"bybit-linear-converted={converted_root}", "--keep-hours", "24",
+        "--keep-hours-tape", "bybit-linear-converted=72", now="2026-09-27T14:30:00",
+    )
+
+    assert summary["hours"][0]["status"] == "done"
+    assert (converted_root / DAY / HOUR / "BTCUSDT" / "segment-000000.jsonl.zst").read_bytes() == b"converted"
+    assert summary["pruned"] == 1 and not _local(tmp_path, "BTCUSDT").exists()
+
+    bad = subprocess.run(
+        [sys.executable, "-m", "market_tape", "fetch", "--remote-base", REMOTE_BASE, "--plan", str(plan),
+         "--root", f"bybit-linear-converted={converted_root}", "--state-dir", str(tmp_path / "state"), "--keep-hours-tape", "x=-1"],
+        cwd=ROOT, capture_output=True, text=True, env=_environment(tmp_path), check=False,
+    )
+    assert bad.returncode == 2 and "--keep-hours-tape wants TAPE=N" in bad.stderr

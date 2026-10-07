@@ -189,7 +189,7 @@ def recover_idle_root(tape: Tape, *, timeout: float, dry_run: bool) -> dict[str,
             except RuntimeError as exc:
                 # Whatever is still raw simply does not finish this run; the
                 # hours it holds stay on disk and pack on a later one. The
-                # thread is still working, though, and the lock this holds is
+                # thread may still be working, though, and the lock this holds is
                 # the promise that nothing else writes raw files under the
                 # root: drop what it has not started and wait for the one
                 # `zstd` call in flight, which `ZSTD_TIMEOUT_SECONDS` bounds.
@@ -204,8 +204,8 @@ def recover_idle_root(tape: Tape, *, timeout: float, dry_run: bool) -> dict[str,
         finally:
             os.umask(umask)
         print(
-            f"market tape: {tape.name}: recovered {raw} raw segment(s) under {tape.root} "
-            f"in {time.monotonic() - started:.0f}s compressed={compressor.compressed} failed={compressor.failed}"
+            f"market tape: {tape.name}: {raw} raw segment(s) under {tape.root} "
+            f"in {time.monotonic() - started:.0f}s: compressed={compressor.compressed} failed={compressor.failed}"
         )
         return {"raw": raw, "recovered": compressor.compressed, "failed": compressor.failed, "held": False}
     finally:

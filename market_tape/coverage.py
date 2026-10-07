@@ -34,7 +34,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
-from market_tape.config import Feed
+from market_tape.config import VENUES, Feed
 from market_tape.load import Source, _hour_key, _hour_text, iter_coverage, iter_rows
 from market_tape.schema import coverage_payload, feed_of_row
 from market_tape.storage import utc_day_hour
@@ -557,7 +557,9 @@ def _rows_by_feed(source: Source, hour: str, symbols: set[str] | None) -> dict[t
 
 
 class _Topics:
-    """One venue topic per (venue, market, symbol, feed), from the venue's own adapter."""
+    """One venue topic per (venue, market, symbol, feed), from the venue's own
+    adapter. A venue no adapter records (a converted root's) names none: its
+    records carry no shard or disconnect to match one against."""
 
     def __init__(self) -> None:
         self._adapters: dict[tuple[str, str], VenueAdapter] = {}
@@ -565,6 +567,8 @@ class _Topics:
 
     def of(self, venue: str, market: str, symbol: str, feed: str) -> str:
         key = (venue, market, symbol, feed)
+        if key not in self._topics and venue not in VENUES:
+            self._topics[key] = ""
         if key not in self._topics:
             adapter = self._adapters.get((venue, market))
             if adapter is None:
