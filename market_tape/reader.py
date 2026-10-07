@@ -73,6 +73,7 @@ import struct
 import sys
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 from websockets.client import ClientProtocol
@@ -302,6 +303,31 @@ def tcp_info(sock: sockets.socket) -> dict[str, int]:
     }
 
 
+def connect_ipv4(host: str, port: int, remaining: Callable[[], float]) -> sockets.socket:
+    """A TCP connection to `host` over IPv4 alone, each address given an even
+    share of the time `remaining` leaves. A venue's stream host can answer
+    AAAA records too (`stream.bybit.com` does), and `socket.create_connection`
+    takes IPv6 first on a host holding a global IPv6 address, one address at a
+    time with the whole timeout each: a black-holed IPv6 path spends the open's
+    deadline before IPv4 is tried."""
+
+    addresses = [info[4] for info in sockets.getaddrinfo(host, port, sockets.AF_INET, sockets.SOCK_STREAM)]
+    if not addresses:
+        raise OSError(f"{host} resolved to no IPv4 address")
+    last: OSError | None = None
+    for index, address in enumerate(addresses):
+        sock = sockets.socket(sockets.AF_INET, sockets.SOCK_STREAM)
+        sock.settimeout(remaining() / (len(addresses) - index))
+        try:
+            sock.connect(address)
+            return sock
+        except OSError as error:
+            sock.close()
+            last = error
+    assert last is not None
+    raise last
+
+
 def open_link(
     url: str,
     *,
@@ -324,7 +350,7 @@ def open_link(
             raise TimeoutError(f"connecting to {uri.host} took over {timeout:g}s")
         return left
 
-    sock = sockets.create_connection((uri.host, uri.port), timeout=timeout)
+    sock = connect_ipv4(uri.host, uri.port, remaining)
     try:
         sock.setsockopt(sockets.IPPROTO_TCP, sockets.TCP_NODELAY, 1)
         tls = incoming = outgoing = None

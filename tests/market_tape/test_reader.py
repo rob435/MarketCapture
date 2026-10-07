@@ -105,7 +105,9 @@ class Driver:
 
 
 def _served(handler: Callable[[Any], None], **options: Any) -> Any:
-    server = serve(handler, "localhost", 0, **options)
+    # IPv4, as the reader dials (`reader.connect_ipv4`); the name stays
+    # localhost for the certificate.
+    server = serve(handler, "127.0.0.1", 0, **options)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
