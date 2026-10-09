@@ -140,6 +140,8 @@ READER_EXIT_SECONDS = 5.0
 WRITE_IDLE_SECONDS = 0.05
 #: A frame the writer cannot record is counted every time and logged at most this often.
 MALFORMED_LOG_SECONDS = 60.0
+#: How soon the main thread acts on a stop signal its handler marked.
+SIGNAL_POLL_SECONDS = 0.2
 #: Subscription frames one shard sends leave this far apart: Binance drops a
 #: connection that sends it more than ten messages a second, pings and pongs
 #: included, and Bybit refuses a burst. Both venues get this spacing.
@@ -1410,6 +1412,8 @@ class Recorder:
         self.frames: FrameQueue = FrameQueue(storage.queue_frames, int(storage.queue_max_mb * 1024**2))
         self.reader = ReaderProcess(self.frames)
         self.stop = threading.Event()
+        # Set by the SIGTERM/SIGINT handler, which takes no lock (`_install_signals`).
+        self.signalled = False
         # Set to run a retention pass before the next routine interval, and on
         # shutdown so the pruner's wait is not what a stop waits out.
         self.prune_now = threading.Event()
@@ -1510,7 +1514,8 @@ class Recorder:
         self.pruner.start()
         self.resyncer.start()
         try:
-            self.stop.wait()
+            while not self.signalled and not self.stop.wait(SIGNAL_POLL_SECONDS):
+                pass
         finally:
             self.stop.set()
             self.prune_now.set()
@@ -1546,8 +1551,13 @@ class Recorder:
             unlock_root(root_lock)
 
     def _install_signals(self) -> None:
+        # Python runs a handler on the main thread between two bytecodes, so
+        # one can land inside that thread's own `stop.set()` or `stop.wait()`,
+        # which hold the event's non-reentrant lock: a stop rarely comes alone
+        # (`timeout` then its process group, a unit's stop to every process, a
+        # second Ctrl-C). The handler only marks the stop; `run` sets the event.
         def stop(_signum: int, _frame: Any) -> None:
-            self.stop.set()
+            self.signalled = True
 
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)

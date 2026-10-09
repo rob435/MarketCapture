@@ -11,6 +11,7 @@ import os
 import logging
 import queue
 import random
+import signal
 import socket as sockets
 import subprocess
 import sys
@@ -99,6 +100,66 @@ def test_a_recorder_refuses_a_root_another_recorder_holds(tmp_path: Path) -> Non
 
     assert str(recorder.root) in str(refused.value)
     assert not recorder.compressor.thread.is_alive()
+
+
+def test_a_stop_signal_landing_while_the_stop_event_is_held_stops_the_recorder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stop rarely comes alone: `timeout` signals the recorder and then its
+    process group, a unit's stop signals every process in it, and a second
+    Ctrl-C follows the first. Python runs the handler on the main thread
+    between two bytecodes, so one can land while that thread is inside the
+    stop event's `set` or `wait`, holding its lock; a handler that took that
+    lock again hung the recorder until SIGKILL, losing the drain."""
+
+    recorder = build(tmp_path, Tier("deep", (Feed("trades"),), Universe("symbols", symbols=("BTCUSDT",))))
+    saved = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        recorder._install_signals()
+        handler = signal.getsignal(signal.SIGTERM)
+    finally:
+        for number, previous in saved.items():
+            signal.signal(number, previous)
+    assert callable(handler)
+
+    def lands_inside_the_event() -> None:
+        with recorder.stop._cond:  # type: ignore[attr-defined]  # what `Event.set` and `wait` hold
+            handler(signal.SIGTERM, None)
+
+    landed = threading.Thread(target=lands_inside_the_event, daemon=True)
+    landed.start()
+    landed.join(5.0)
+    assert not landed.is_alive(), "the handler waited on a lock its own thread held"
+
+    # And the recorder stops on what the handler did. `signal.signal` is the
+    # main thread's alone, so the recorder runs on another with the handler
+    # already in hand.
+    monkeypatch.setattr(recorder, "_install_signals", lambda: None)
+    monkeypatch.setattr(recorder, "_reconcile_tier", lambda name, topics: None)
+    recorder.adapter.fetch_tables = lambda: {"instruments": [instrument("BTCUSDT")], "tickers": []}  # type: ignore[method-assign]
+    recorder.retention.min_free_bytes = 1
+    failures: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            recorder.run()
+        except BaseException as exc:  # reported on the test's thread
+            failures.append(exc)
+
+    runner = threading.Thread(target=run, name="test-recorder", daemon=True)
+    runner.start()
+    try:
+        deadline = time.monotonic() + 10.0
+        while not (tmp_path / "status.json").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert (tmp_path / "status.json").exists(), "the recorder never wrote its first status"
+        handler(signal.SIGTERM, None)
+        runner.join(10.0)
+        assert not runner.is_alive(), "the recorder did not stop on the signal"
+    finally:
+        recorder.stop.set()
+        runner.join(30.0)
+    assert failures == []
 
 
 def test_a_symbol_file_that_names_nothing_is_refused(tmp_path: Path) -> None:
