@@ -150,8 +150,12 @@ def test_nothing_is_re_anchored_because_every_row_is_whole() -> None:
 
 def test_the_venue_refuses_what_it_cannot_record() -> None:
     adapter = BinanceAdapter()
-    adapter.validate_feeds(feeds("book:1", "book:5", "book:10", "book:20", "trades", "ticker", "kline:1M", "open_interest:60"))
-    for text in ("book:50", "book:1000", "kline:5s", "funding", "account_ratio"):
+    adapter.validate_feeds(
+        feeds("book:1", "book:5", "book:10", "book:20", "book:1000", "trades", "ticker", "kline:1M", "open_interest:60")
+    )
+    with pytest.raises(ConfigError, match=r"the 1000-level diff book\), not book:50"):
+        adapter.validate_feeds(feeds("book:50"))
+    for text in ("book:50", "book:500", "kline:5s", "funding", "account_ratio"):
         with pytest.raises(ConfigError):
             adapter.validate_feeds(feeds(text))
 

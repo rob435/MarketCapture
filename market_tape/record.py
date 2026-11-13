@@ -168,6 +168,13 @@ REANCHOR_CHUNK = 10
 #: instead of sleeping out the rest of this interval.
 RETENTION_INTERVAL_SECONDS = 300.0
 LANES = "lanes"
+#: A queue item's kind that carries no rows: `(CHAIN_RESET, topics, ns, LANES, 0)`,
+#: queued by a shard before it (re)subscribes `topics`, so the writer tells the
+#: adapter (`chain_reset`) in tape order: after the last frame of the old
+#: subscription, ahead of the first of the new.
+CHAIN_RESET = "chain_reset"
+#: A queued chain reset's estimate per topic name.
+QUEUE_TOPIC_BYTES = 64
 #: What the writer takes. A socket frame is queued as the reader's event, the
 #: events pipe's bytes (`reader.EVENT`, then the payload), one object whose
 #: header holds its link and both stamps: a backlog of a million frames is a
@@ -212,6 +219,8 @@ def queue_item_bytes(item: QueueItem | None) -> int:
         return QUEUE_EVENT_OVERHEAD_BYTES + len(item)
     if item[0] == "frame":
         return QUEUE_ITEM_OVERHEAD_BYTES + len(item[1])
+    if item[0] == CHAIN_RESET:
+        return QUEUE_ITEM_OVERHEAD_BYTES + QUEUE_TOPIC_BYTES * len(item[1])
     return QUEUE_ITEM_OVERHEAD_BYTES + QUEUE_ROW_BYTES * len(item[1])
 
 
@@ -1092,8 +1101,29 @@ class Shard:
         self.topics = list(topics)
         if (added or removed) and self.connected and self.socket is not None:
             self._send_all(self.adapter.remove_messages(removed))
+            self._reset_chains(added)
             self._send_all(self.adapter.add_messages(added))
         return added, removed
+
+    def _reset_chains(self, topics: list[str]) -> None:
+        """Queue a chain reset for those of `topics` the adapter re-bases from
+        REST (`rest_based_topics`), ahead of the subscribe that is about to
+        go out: no frame of theirs can reach the queue before the venue has
+        the subscribe, so the writer meets the reset between the old
+        subscription's last frame and the new one's first. A queue with no
+        room drops the reset; the frames behind it overrun too, which breaks
+        the chain on its own."""
+
+        based = getattr(self.adapter, "rest_based_topics", None)
+        if not topics or not callable(based) or self.reader is None:
+            return
+        chains = list(based(topics))
+        if not chains:
+            return
+        try:
+            self.reader.frames.put((CHAIN_RESET, chains, time.time_ns(), LANES, 0), block=False)
+        except queue.Full:
+            logging.warning("shard %d: no queue room to reset %d book chains", self.index, len(chains))
 
     def anchored_count(self) -> int:
         return len(self.adapter.anchored_topics(self.topics))
@@ -1230,6 +1260,7 @@ class Shard:
                 return
             self.connected = True
             self._note(self.on_connect)
+            self._reset_chains(topics)
             self._send_all(self.adapter.subscribe_messages(topics))
             logging.info("shard %d connected with %d topics", self.index, len(topics))
             while not self.stop.is_set() and not link.ended.wait(1.0):
@@ -1377,6 +1408,9 @@ class Recorder:
             config.venue.name, market=config.venue.market, ws_url=config.venue.ws_url, rest_url=config.venue.rest_url
         )
         validate_config(self.adapter, config)
+        configure = getattr(self.adapter, "configure", None)
+        if callable(configure):
+            configure(config)
         resolved_root = root or config.storage.root
         if resolved_root is None:
             raise ConfigError("the recorder needs a storage root: storage.root in the config or --root")
@@ -1462,8 +1496,11 @@ class Recorder:
         self.tier_topics: dict[str, list[str]] = {tier.name: [] for tier in config.tiers}
         self.tier_shards: dict[str, list[Shard]] = {tier.name: [] for tier in config.tiers}
         self.feeds_by_symbol: dict[str, tuple[Feed, ...]] = {}
-        #: A book row's (symbol, depth) as the row carries them, to its anchored topic or "".
+        #: A book row's (symbol, depth) as the row carries them, to its anchored
+        #: or REST-based topic, or "".
         self._book_topic_cache: dict[tuple[Any, Any], str] = {}
+        #: The cached topics the adapter re-bases from REST: accounted, never re-subscribed.
+        self._rest_based_topics: set[str] = set()
         self._feed_keys: dict[tuple[Any, ...], str] = {}
         self._tier_keys: dict[str, str] = {}
         self.lanes: list[threading.Thread] = []
@@ -1657,8 +1694,10 @@ class Recorder:
     def _on_shard_disconnect(self, shard: Shard) -> None:
         self.coverage.disconnected(shard.index, shard.tier, list(shard.topics), time.time_ns())
 
-    def emit(self, row: Mapping[str, Any]) -> None:
-        """Hand an already normalized row to the writer: what a side lane built."""
+    def emit(self, row: Mapping[str, Any]) -> bool:
+        """Hand an already normalized row to the writer: what a side lane built.
+        Returns whether it was queued; a full queue drops it as an overrun,
+        and a lane that must have the row (a book snapshot) asks again."""
 
         received = int(row.get("local_receive_ts_ns") or time.time_ns())
         self._on_frame(received)
@@ -1666,6 +1705,8 @@ class Recorder:
             self.frames.put_nowait(("rows", [dict(row)], received, LANES, 0))
         except queue.Full:
             self._on_overrun()
+            return False
+        return True
 
     # ------------------------------------------------------------- universe
 
@@ -2017,6 +2058,9 @@ class Recorder:
             kind, payload, tier = "frame", item[reader.EVENT.size :], self.reader.tiers.get(ident, "")
         else:
             kind, payload, received_ns, tier, mono_ns = item
+            if kind == CHAIN_RESET:
+                self._reset_chains(payload)
+                return received_ns
             count = len(payload)
         if kind == "frame":
             batch_meters[self._tier_keys.get(tier) or self._tier_key(tier)] += count
@@ -2039,9 +2083,10 @@ class Recorder:
                 row_kind = row.get("kind")
                 # This runs for every row; a clean delta, which is most of the
                 # tape, never reaches the book bookkeeping, and nor does a book
-                # the adapter does not anchor (every Binance book row is a
-                # snapshot). A book row is its frame's only row, so each is
-                # noted before its frame's append.
+                # the adapter neither anchors nor re-bases from REST (Binance's
+                # whole-book `book:1` to `book:20` snapshots, found uncached
+                # once). A book row is its frame's only row, so each is noted
+                # before its frame's append.
                 if (
                     row_kind == KIND_BOOK_SNAPSHOT or (row_kind == KIND_BOOK_DELTA and row.get("sequence_gap"))
                 ) and self._book_topic(row) is not None:
@@ -2102,6 +2147,9 @@ class Recorder:
                     self.resync_outstanding.discard(topic)
                 continue
             self.coverage.book_gap(topic, str(row.get("symbol") or ""), int(row.get("depth") or 0), received_ns)
+            if topic in self._rest_based_topics:
+                # The adapter's REST lane re-bases it; a subscribe brings no snapshot.
+                continue
             with self.resync_lock:
                 # A topic no snapshot has based yet is waiting for the one its
                 # subscription brings, which lands without a re-subscribe and
@@ -2113,9 +2161,10 @@ class Recorder:
             self.resync_now.set()
 
     def _book_topic(self, row: Mapping[str, Any]) -> str | None:
-        """The row's book topic when the adapter anchors it; None otherwise. A
-        book the adapter does not anchor is whole in every row (Binance's), so
-        it never gaps and a snapshot of it re-bases nothing."""
+        """The row's book topic when the adapter anchors it or re-bases it from
+        REST (`rest_based_topics`); None otherwise. Any other book is whole in
+        every row (Binance's `book:1` to `book:20`), so it never gaps and a
+        snapshot of it re-bases nothing."""
 
         key = (row.get("symbol"), row.get("depth"))
         topic = self._book_topic_cache.get(key)
@@ -2124,10 +2173,27 @@ class Recorder:
             depth = key[1]
             if not symbol or depth is None:
                 return None
-            topics = self.adapter.anchored_topics(self.adapter.topics(symbol, (Feed("book", str(int(depth))),)))
+            names = self.adapter.topics(symbol, (Feed("book", str(int(depth))),))
+            topics = self.adapter.anchored_topics(names)
+            if not topics:
+                based = getattr(self.adapter, "rest_based_topics", None)
+                topics = list(based(names)) if callable(based) else []
+                self._rest_based_topics.update(topics)
             topic = topics[0] if topics else ""
             self._book_topic_cache[key] = topic
         return topic or None
+
+    def _reset_chains(self, topics: list[str]) -> None:
+        """A shard's queued `CHAIN_RESET`, on the writer thread where the
+        adapter keeps its chains."""
+
+        reset = getattr(self.adapter, "chain_reset", None)
+        if not callable(reset):
+            return
+        try:
+            reset(topics)
+        except Exception:  # a hook's failure must not stop the tape
+            logging.exception("could not reset %d book chains", len(topics))
 
     def _effective_stream_ns(self) -> int:
         """The stream timestamp storage should pace its rolls by.
@@ -2454,6 +2520,12 @@ class Recorder:
             "queue_wait": self._queue_wait_status(),
             "fast_json": FAST_JSON,
         }
+        lane_status = getattr(self.adapter, "lane_status", None)
+        if callable(lane_status):
+            try:
+                payload["lanes_status"] = lane_status()
+            except Exception as exc:  # the status file outranks one lane's account of itself
+                payload["lanes_status"] = {"error": str(exc)[:200]}
         atomic_json(self.root / "status.json", payload)
         logging.info(
             "capture status frames=%d rows=%d dropped=%d disk_dropped=%d malformed=%d queued=%d queued_bytes=%d "

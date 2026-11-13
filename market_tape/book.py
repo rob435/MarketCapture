@@ -20,7 +20,22 @@ What chaining means is the venue's own rule:
   `lastUpdateId` are dropped, the first one kept must span that id
   (`U <= lastUpdateId <= u`), and every diff after it must name the last one
   applied as its own predecessor (`pu`). A snapshot too stale to meet the held
-  diffs leaves the book bad and the diffs held for the next snapshot.
+  diffs leaves the book bad and the diffs held for the next snapshot. A
+  snapshot newer than every diff held leaves the book good and waiting: the
+  later diffs it covers are dropped, and the first that spans it applies.
+
+  A snapshot can also land on a book that is already good: the recorder
+  takes one per symbol per hour so an hour replays alone. The diffs between
+  its `lastUpdateId` and now were applied already and are no longer held, so
+  the book keeps the last `RECENT_DELTAS` it applied and re-bases onto the
+  snapshot by replaying them under the same rule. A snapshot those cannot
+  bracket (older than the oldest kept, or sitting in a hole) changes nothing:
+  the book the chain built is still the venue's book, and breaking it would
+  throw that away.
+
+  An hour replayed alone opens with diffs and no snapshot: the recorder's
+  lane takes the hour's snapshots at 50 a minute, ~11 minutes for a full
+  universe, so `HELD_DELTAS` holds 20 minutes of 100 ms diffs.
 """
 
 from __future__ import annotations
@@ -30,8 +45,12 @@ from typing import Any
 
 from market_tape.schema import BookRow
 
-#: Diffs held while a Binance book waits for a snapshot it can chain onto.
-HELD_DELTAS = 5_000
+#: Diffs held while a Binance book waits for a snapshot it can chain onto:
+#: 20 minutes of the 100 ms stream.
+HELD_DELTAS = 12_000
+#: Diffs a good Binance book keeps after applying them, to re-base onto a
+#: snapshot that lands behind them: two minutes of the 100 ms stream.
+RECENT_DELTAS = 1_200
 
 
 class Book:
@@ -47,6 +66,10 @@ class Book:
         self._valid = False
         self._awaiting_first_delta = False
         self._held: deque[BookRow] = deque(maxlen=HELD_DELTAS)
+        #: A good Binance book's applied diffs, newest last, chained up to `last_update_id`.
+        self._recent: deque[BookRow] = deque(maxlen=RECENT_DELTAS)
+        #: Binance snapshots that landed on a good book and could not be bracketed, so changed nothing.
+        self.snapshots_passed = 0
 
     @property
     def held_deltas(self) -> int:
@@ -70,16 +93,68 @@ class Book:
         return self._take_delta(row)
 
     def _take_snapshot(self, row: BookRow) -> bool:
+        if row.venue == "binance" and self._valid:
+            if self._rebase(row):
+                self.rows_applied += 1
+            else:
+                self.snapshots_passed += 1
+            return self._valid
+        self.rows_applied += 1
         self._bids = {price: size for price, size in row.bids if size > 0}
         self._asks = {price: size for price, size in row.asks if size > 0}
         self.last_update_id = row.update_id
         self.snapshot_update_id = row.update_id
         self._awaiting_first_delta = row.venue == "binance"
         self._valid = True
-        self.rows_applied += 1
         if row.venue == "binance":
+            self._recent.clear()
             self._replay()
         return self._valid
+
+    def _rebase(self, row: BookRow) -> bool:
+        """A Binance snapshot on a book that is already good: re-base onto it
+        and replay the recent diffs it does not cover, or keep the book the
+        chain built when they cannot bracket it. Returns whether it re-based."""
+
+        snapshot_id = row.update_id
+        kept = [delta for delta in self._recent if delta.update_id >= snapshot_id]
+        if not kept:
+            if snapshot_id < self.last_update_id:
+                # Older than the book, and nothing kept reaches back to it.
+                return False
+            # Level with or newer than every diff applied: the book waits for
+            # the diff that spans it, dropping the ones it covers.
+            self._bids = {price: size for price, size in row.bids if size > 0}
+            self._asks = {price: size for price, size in row.asks if size > 0}
+            self.last_update_id = snapshot_id
+            self.snapshot_update_id = snapshot_id
+            self._awaiting_first_delta = True
+            self._recent.clear()
+            return True
+        first = kept[0]
+        if not first.first_update_id <= snapshot_id <= first.update_id:
+            return False
+        bids = {price: size for price, size in row.bids if size > 0}
+        asks = {price: size for price, size in row.asks if size > 0}
+        last = None
+        for delta in kept:
+            if last is not None and delta.previous_update_id != last:
+                # The recent diffs chain by construction; a broken link here means
+                # they are not what the book was built from, so leave it be.
+                return False
+            for side, changes in ((bids, delta.bids), (asks, delta.asks)):
+                for price, size in changes:
+                    if size > 0:
+                        side[price] = size
+                    else:
+                        side.pop(price, None)
+            last = delta.update_id
+        self._bids, self._asks = bids, asks
+        self.snapshot_update_id = snapshot_id
+        self.last_update_id = kept[-1].update_id
+        self._awaiting_first_delta = False
+        self._recent = deque(kept, maxlen=RECENT_DELTAS)
+        return True
 
     def _take_delta(self, row: BookRow) -> bool:
         if row.venue == "binance":
@@ -116,12 +191,15 @@ class Book:
             # it saw nothing before it; the snapshot's bracket is the authority here.
             if not row.first_update_id <= self.snapshot_update_id <= row.update_id:
                 self._valid = False
+                self._recent.clear()
                 return False
             self._awaiting_first_delta = False
         elif row.sequence_gap or row.previous_update_id != self.last_update_id:
             self._valid = False
+            self._recent.clear()
             return False
         self._change(row)
+        self._recent.append(row)
         return True
 
     def _change(self, row: BookRow) -> None:
@@ -196,6 +274,7 @@ class Book:
             "valid": self._valid,
             "rows_applied": self.rows_applied,
             "held_deltas": len(self._held),
+            "snapshots_passed": self.snapshots_passed,
             "last_update_id": self.last_update_id,
             "snapshot_update_id": self.snapshot_update_id,
             "best_bid": list(best_bid) if best_bid is not None else None,

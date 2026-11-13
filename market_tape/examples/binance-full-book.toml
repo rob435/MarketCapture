@@ -1,0 +1,33 @@
+# Binance USD-M's full 1000-level book for a few majors, recorded as tardis.dev
+# records it: the `<pair>@depth@100ms` diff stream plus REST snapshots
+# (`/fapi/v1/depth?limit=1000`), one per symbol whenever its diff chain breaks
+# and one per symbol per UTC hour, so each hour's tar replays alone
+# (market_tape/venues/binance.py). Beside it the top of book, the prints, the
+# ticker and the liquidations.
+#
+# Each snapshot costs 20 of the venue's 2,400 request weight a minute per IP;
+# the lane spends at most 1,000 of it (50 snapshots a minute), so a handful of
+# symbols is based within seconds of a connect. The streams flow where
+# `fapi.binance.com` answers 451, but the snapshots then do not: there the
+# diff book records gaps only (`status.json` `lanes_status`).
+#
+#   python -m market_tape record --config market_tape/examples/binance-full-book.toml --root ./tape-binance-book
+schema = 1
+
+[venue]
+name = "binance"
+market = "usdm"
+
+[storage]
+retention_days = 7
+max_disk_gb = 50
+min_free_disk_gb = 2
+# Each open segment's write buffer must hold the longest row: a 1000-level
+# snapshot row is ~45-55 KB of JSON, so the default 64 KB is enough. Do not
+# lower it below that for a tier carrying `book:1000`.
+segment_buffer_kb = 64
+
+[[tier]]
+name = "majors"
+feeds = ["book:1000", "book:1", "trades", "ticker", "liquidations"]
+universe = { kind = "symbols", symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"] }

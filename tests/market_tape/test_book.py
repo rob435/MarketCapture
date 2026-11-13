@@ -162,6 +162,106 @@ def test_binance_holds_the_diffs_when_the_snapshot_is_too_stale() -> None:
     assert book.best_bid == (99.0, 2.0)
 
 
+def _binance_chain(start: int, count: int, *, width: int = 3, price: float = 99.0) -> list[BookRow]:
+    """`count` chained diffs from `start + 1`, each `width` ids wide, each setting one bid level."""
+
+    rows = []
+    previous = start
+    for index in range(count):
+        last = previous + width
+        rows.append(
+            _row(
+                venue="binance",
+                depth=1000,
+                first_update_id=previous + 1,
+                update_id=last,
+                previous_update_id=previous,
+                bids=[[f"{price - index:.1f}", f"{index + 1}"]],
+            )
+        )
+        previous = last
+    return rows
+
+
+def _binance_snapshot(update_id: int, bids: list[list[str]]) -> BookRow:
+    return _row(venue="binance", depth=1000, snapshot=True, update_id=update_id, bids=bids, asks=[["101", "1"]])
+
+
+def test_binance_snapshot_on_a_good_book_re_bases_and_replays_the_recent_diffs() -> None:
+    book = Book()
+    book.apply(_binance_snapshot(101, [["50", "1"]]))  # inside the first diff, 101..103
+    diffs = _binance_chain(100, 10)  # ids 101..130
+    assert all(book.apply(row) for row in diffs)
+    built = book.levels(1000)
+
+    # The hour's snapshot, fetched at id 115 (the end of the fifth diff,
+    # 113..115), lands after all ten: the venue's book then was the chain's then.
+    venue_then = [[f"{99.0 - index:.1f}", f"{index + 1}"] for index in range(5)] + [["50", "1"]]
+    assert book.apply(_binance_snapshot(115, venue_then))
+    assert book.valid and book.snapshot_update_id == 115 and book.last_update_id == 130
+    assert book.levels(1000) == built
+    assert book.snapshots_passed == 0
+    # The chain carries on from the last replayed diff.
+    (more,) = _binance_chain(130, 1, price=10.0)
+    assert book.apply(more)
+
+    # A snapshot whose venue book differs from the chain's wins: it is the
+    # venue's. It ends where the last diff ends, which is replayed onto it.
+    assert book.apply(_binance_snapshot(133, [["42", "7"]]))
+    assert book.levels(1000)[0] == [(42.0, 7.0), (10.0, 1.0)]
+
+
+def test_binance_snapshot_too_stale_for_the_recent_diffs_keeps_the_book_the_chain_built() -> None:
+    book = Book()
+    book.apply(_binance_snapshot(101, [["50", "1"]]))  # inside the first diff, 101..103
+    for row in _binance_chain(100, 1_300):  # more than the ring keeps
+        assert book.apply(row)
+    built = book.levels(1000)
+    last = book.last_update_id
+    # Older than the oldest kept diff: nothing can bracket it, and breaking a
+    # good book for it would throw the book away.
+    assert book.apply(_binance_snapshot(150, [["1", "1"]]))
+    assert book.valid and book.levels(1000) == built
+    assert (book.last_update_id, book.snapshot_update_id, book.snapshots_passed) == (last, 101, 1)
+    # A snapshot in a hole between two diffs (ids the venue skipped) is no better.
+    skipping = _row(venue="binance", depth=1000, first_update_id=last + 5, update_id=last + 8, previous_update_id=last)
+    assert book.apply(skipping)
+    assert book.apply(_binance_snapshot(last + 2, [["1", "1"]])) and book.snapshots_passed == 2
+    assert book.levels(1000) == built
+    (more,) = _binance_chain(last + 8, 1, price=5.0)
+    assert book.apply(more) and book.valid
+
+
+def test_binance_snapshot_newer_than_every_diff_waits_for_the_one_that_spans_it() -> None:
+    book = Book()
+    book.apply(_binance_snapshot(101, [["50", "1"]]))  # inside the first diff, 101..103
+    diffs = _binance_chain(100, 6)  # ids 101..118
+    for row in diffs[:3]:  # 101..109 applied; the rest still on their way
+        assert book.apply(row)
+    assert book.apply(_binance_snapshot(113, [["77", "1"]]))
+    assert book.valid and book.last_update_id == 113 and book.levels(1)[0] == [(77.0, 1.0)]
+    # 110..112 is covered by the snapshot; 113..115 spans it; 116..118 chains on.
+    assert book.apply(diffs[3])
+    assert book.levels(1000)[0] == [(77.0, 1.0)]
+    assert book.apply(diffs[4]) and book.apply(diffs[5])
+    assert book.valid and book.last_update_id == 118
+    assert book.levels(1000)[0] == [(95.0, 5.0), (94.0, 6.0), (77.0, 1.0)]
+
+
+def test_binance_hour_replayed_alone_holds_its_opening_diffs_until_the_hours_snapshot() -> None:
+    # An hour's tar opens mid-chain: minutes of diffs, then the lane's hourly
+    # snapshot of this symbol, then more diffs. 6,000 diffs is ten minutes at 100 ms.
+    diffs = _binance_chain(5_000, 6_100, width=2)
+    snapshot_at = 5_000 + 2 * 6_000 - 1  # inside the 6,000th diff
+    book = Book()
+    assert not any(book.apply(row) for row in diffs[:6_050])
+    assert book.held_deltas == 6_050
+    assert book.apply(_binance_snapshot(snapshot_at, [["1", "1"]]))
+    assert book.valid and book.held_deltas == 0
+    assert book.last_update_id == diffs[6_049].update_id
+    assert all(book.apply(row) for row in diffs[6_050:])
+
+
 def test_a_bybit_delta_before_a_snapshot_is_not_held() -> None:
     book = Book()
     assert not book.apply(_row(update_id=5, bids=[["99", "1"]]))

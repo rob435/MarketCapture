@@ -26,7 +26,7 @@ Records one venue's public market data per process, compresses it, ships hourly 
 | Venue | Module | Beyond its docstring |
 | :--- | :--- | :--- |
 | Bybit linear | `market_tape/venues/bybit.py` | `listed`: `status=Trading`, `LinearPerpetual`, `symbolType` in `market_tape/venues/bybit.py::CRYPTO_SYMBOL_TYPES`. A refused subscribe (`market_tape/venues/bybit.py::BybitAdapter::_subscribe_reply`) is a `WARNING`. Ticker: a snapshot on subscribe, then changed fields only; `funding_rate` is the running rate for the next settlement |
-| Binance USD-M | `market_tape/venues/binance.py` | Field mappings: its normalizers (`market_tape/venues/binance.py::BinanceAdapter::normalize`). `fapi.binance.com` answers 451 from restricted locations while the streams still flow; without `exchangeInfo`, `listed` holds nothing and `snapshot_failures` counts |
+| Binance USD-M | `market_tape/venues/binance.py` | Field mappings: its normalizers (`market_tape/venues/binance.py::BinanceAdapter::normalize`). `fapi.binance.com` answers 451 from restricted locations while the streams still flow; without `exchangeInfo`, `listed` holds nothing and `snapshot_failures` counts, and `book:1000`'s REST snapshots fail (`status.json` `lanes_status.depth_snapshots`). `book:1000` is the diff stream plus REST snapshots (`market_tape/venues/binance.py::DepthSnapshotLane`), unmeasured against the venue: built from its published docs, tested against local fakes |
 
 ## 4. Files
 
@@ -35,7 +35,7 @@ Root layout, segment lifecycle and durability: `market_tape/storage.py` docstrin
 * `status.json`: a watchdog reads its mtime and `last_receive_ns`, measuring from `started_at_ns`. Also `dropped_frames`, `disk_dropped_frames`, `queued_*`, `shards[]` (`reanchors`, `resyncs`, `link`: the reader's last `STATS` of the connection, `market_tape/reader.py` docstring), `budget`, `compressor` (`failed`, `deferred`), `clock` (receipt less the venue's send stamp, `market_tape/record.py::Recorder::_clock_status`), `queue_wait`, `fast_json` (`orjson` present), and tier membership. The tick that writes it never walks the tape or fsyncs.
 * A thin name's segment reads 0 bytes until its write buffer fills.
 * Capture queue: bounded by `storage.queue_frames` and `storage.queue_max_mb`; a shard without room under both for `market_tape/reader.py::QUEUE_PUT_TIMEOUT_SECONDS` overruns (`dropped_frames`) and reconnects for fresh snapshots.
-* Every Bybit book and ticker topic is re-subscribed once per UTC hour (`connection.reanchor_each_hour`), so every hour replays alone; the seam falls on funding settlement and loses one round trip of deltas. Binance's rows need none.
+* Every Bybit book and ticker topic is re-subscribed once per UTC hour (`connection.reanchor_each_hour`), so every hour replays alone; the seam falls on funding settlement and loses one round trip of deltas. Binance's whole-book rows (`book:1` to `book:20`) and tickers need none; its `book:1000` is re-based by a REST snapshot per symbol each hour instead, with no re-subscribe and no seam (`market_tape/venues/binance.py::DepthSnapshotLane`, `status.json` `lanes_status`).
 
 ### Coverage record and ledger
 
@@ -63,6 +63,17 @@ Shared by a live feed, `market_tape/venues/bybit.py` and `market_tape/record.py`
 | `u == last_u + 1` | apply | `orderbook_delta` | apply |
 | other `u`, or delta before snapshot | `Resync` that topic | `sequence_gap=true`; a based topic is re-subscribed (`shards[].resyncs`), an unbased one waits for its subscription's snapshot | invalid until snapshot |
 | `seq` | recorded, not a rule | `cross_sequence` | not read |
+
+### Book sequence contract (Binance `book:1000`)
+
+Shared by `market_tape/venues/binance.py` (adapter and `DepthSnapshotLane`), `market_tape/record.py` (recorder) and `market_tape/book.py` (rebuild); pinned by `tests/market_tape/test_binance_depth.py` and `tests/market_tape/test_book.py`, against local fakes only (the venue answers this sandbox 451).
+
+| Event on one symbol | Recorder | Rebuild |
+| :--- | :--- | :--- |
+| `@depth@100ms` diff, `pu ==` last `u` | `orderbook_delta` (`update_id`=`u`, `previous_update_id`=`pu`, `first_update_id`=`U`) | apply |
+| first diff after start or a (re)subscribe, or `pu !=` last `u` | `sequence_gap=true`; a `book_gap` opens; the lane is asked for a snapshot; never re-subscribed | invalid; diffs held (`HELD_DELTAS`) |
+| REST `/fapi/v1/depth?limit=1000` answer | `orderbook_snapshot` (`update_id`=`lastUpdateId`), after the diffs it does not cover; closes the `book_gap`; not emitted if older than the chain's first `U` | on a bad book: drop held `u < L`, first kept must span `U <= L <= u`, the rest chain on `pu`; on a good book: the same over the last `RECENT_DELTAS` applied, or unchanged when they cannot span it |
+| UTC hour (`connection.reanchor_each_hour`) | one snapshot per diff symbol, sorted, at the lane's pace | as above |
 
 ### Block tape (`market_tape.blocks`, `segment-*.lmtb`)
 

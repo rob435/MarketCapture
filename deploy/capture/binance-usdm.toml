@@ -74,3 +74,16 @@ shed = []
 name = "usdt_perps"
 feeds = ["book:1", "trades"]
 universe = { kind = "listed", quote = "USDT" }
+
+# The full 1000-level book (`book:1000`: the `<pair>@depth@100ms` diff stream
+# plus REST snapshots, market_tape/venues/binance.py) is not recorded here: the
+# owner sizes this host first. Not measured — the diff stream's volume and the
+# snapshot rows (~45-55 KB each, so `segment_buffer_kb` must go back to 64 or
+# more) come on top of the figures above, and the snapshot lane spends up to
+# 1,000 of the IP's 2,400 request weight a minute (50 snapshots a minute: a
+# whole-universe connect takes ~11 minutes to base). A tier of majors would read:
+#
+# [[tier]]
+# name = "full_book"
+# feeds = ["book:1000"]
+# universe = { kind = "symbols", symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"] }

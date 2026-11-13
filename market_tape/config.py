@@ -54,7 +54,8 @@ universe = { kind = "listed", quote = "USDT", exclude_tiers = ["core"] }
 ```
 
 Feeds: `book:<levels>` (the venue says which level counts it offers; `book:1`
-is the top of book), `trades`, `ticker` (last, mark, index, funding, open
+is the top of book; Binance's `book:1000` is its diff stream re-based by REST
+snapshots, `market_tape/venues/binance.py`), `trades`, `ticker` (last, mark, index, funding, open
 interest, best bid and ask, 24h turnover, price change, hour-ago and day-ago
 prices and the day's extremes, as the venue pushes them), `liquidations`,
 `kline:<interval>` (venue candles, e.g. `kline:1m`), `open_interest:<seconds>`

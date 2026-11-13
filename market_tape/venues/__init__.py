@@ -6,6 +6,19 @@ adapter's job. One adapter instance serves one recorder process. `normalize`
 is called from the single writer thread, so an adapter may keep per-topic
 sequence state without locks; side lanes run in their own threads and must
 only hand rows to the `emit` callable they were given.
+
+Optional hooks, which the recorder looks up with `getattr` so an adapter (or
+a test's fake) without them records as before:
+
+- `ping_message()`: the venue's application-level keepalive text.
+- `configure(config)`: the `CaptureConfig`, once, as the recorder is built.
+- `rest_based_topics(topics)`: the book topics the adapter re-bases itself
+  from a REST snapshot lane rather than by re-subscribing. The recorder
+  accounts their gaps and snapshots in the coverage record, as it does an
+  anchored book's, but never re-subscribes them on a gap or the hour.
+- `chain_reset(topics)`: called on the writer thread, in tape order, before
+  the first frame a (re)subscribe of those `rest_based_topics` can bring.
+- `lane_status()`: a small dict of the side lanes' health for `status.json`.
 """
 
 from __future__ import annotations
@@ -15,7 +28,9 @@ from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from market_tape.config import CaptureConfig, ConfigError, Feed
 
-Emit = Callable[[Mapping[str, Any]], None]
+#: Hands a lane's row to the writer: False when it was dropped (the capture
+#: queue had no room), so a lane that must have the row can ask for it again.
+Emit = Callable[[Mapping[str, Any]], "bool | None"]
 
 
 class VenueAdapter(Protocol):

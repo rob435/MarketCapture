@@ -5,9 +5,11 @@ path's streams, silently dropping the rest (measured 2026-09-25):
 
 | Path | Carries | Feeds here |
 | --- | --- | --- |
-| `/stream` (path-less, served as `/public`) | `<pair>@bookTicker`, `<pair>@depth<N>@100ms`, `<pair>@trade` | `book:1`, `book:5/10/20`, `trades` |
+| `/stream` (path-less, served as `/public`) | `<pair>@bookTicker`, `<pair>@depth<N>@100ms`, `<pair>@depth@100ms`, `<pair>@trade` | `book:1`, `book:5/10/20`, `book:1000`, `trades` |
 | `/market/stream` | `<pair>@aggTrade`, `@markPrice@1s`, `@ticker`, `@kline_<i>`, `!forceOrder@arr` | `ticker`, `kline:<i>`, `liquidations` |
 
+(The `/stream` routing of `@depth@100ms` is assumed from its siblings; see
+"Measured versus assumed" below.)
 `wss://fstream.binance.com/stream` is the URL a live top-of-book reader of the
 venue takes, so the tape's top of book is that reader's stream, and `trades`
 is `@trade` on the same socket: every fill on the book (`BOOK_TRADE_TYPES`),
@@ -23,13 +25,39 @@ and pongs included (the recorder spaces its frames
 reader answers; a close at every connection's 24-hour mark, after which the
 shard reconnects.
 
-Every book row is a whole book (`bookTicker` the top level, `depth<N>` the top
-N) and every ticker frame its stream's whole field set, so nothing here needs
-a subscription to anchor it: `anchored_topics` is empty and the hourly
-re-anchor sends nothing. The 1000-level diff book is not recorded: its deltas
-mean something only beside a REST snapshot per symbol per subscribe, which the
-venue's request weight (20 of 2,400 a minute) rations to two a second across
-the universe. Open interest is a REST poll: no stream pushes it.
+`book:1` and `book:5/10/20` rows are whole books (`bookTicker` the top level,
+`depth<N>` the top N) and every ticker frame is its stream's whole field set,
+so nothing here needs a subscription to anchor it: `anchored_topics` is empty
+and the hourly re-anchor sends nothing. Open interest is a REST poll: no
+stream pushes it.
+
+`book:1000` is the full incremental book, recorded as tardis.dev records it:
+the diff stream `<pair>@depth@100ms` (`DIFF_DEPTH_SPEED`, on `/stream`) plus
+REST snapshots (`GET /fapi/v1/depth?limit=1000`). Each diff is one
+`orderbook_delta` row (`update_id` = `u`, `previous_update_id` = `pu`,
+`first_update_id` = `U`) flagged `sequence_gap` when it does not chain onto
+the last diff seen for its symbol (`pu != last u`) and on the first diff
+after a (re)subscribe, which `chain_reset` arranges in tape order. A gap asks
+the snapshot lane (`DepthSnapshotLane`) for a snapshot of that symbol; its
+`orderbook_snapshot` row (`update_id` = `lastUpdateId`) lands on the tape
+after the diffs it does not cover, and `market_tape/book.py` brackets it. The
+lane also takes every diff symbol once per UTC hour (with
+`connection.reanchor_each_hour`), so an hour's tar replays alone. A
+subscription brings no snapshot here, so a gapped diff book is never
+re-subscribed: the recorder accounts its gaps and snapshots in the hour's
+coverage record (`rest_based_topics`) and leaves the re-basing to the lane.
+The snapshot's weight (20 of the venue's 2,400 a minute per IP, shared with
+the open-interest poll and the table reads) is what paces it:
+`SNAPSHOT_WEIGHT_PER_MINUTE` is 50 snapshots a minute, so a cold start or a
+24-hour reconnect of ~550 diff symbols takes ~11 minutes to base them all,
+and the cells read `book_gap` until then.
+
+Measured versus assumed: every other stream above was measured against the
+venue; the diff book was not. This sandbox cannot reach Binance (HTTP 451),
+so the stream name, the REST shape, the `X-MBX-USED-WEIGHT-1M` header and the
+`U`/`u`/`pu` rules follow Binance's published USD-M documentation ("How to
+manage a local order book correctly") and are verified only against local fake
+servers in the tests.
 """
 
 from __future__ import annotations
@@ -39,8 +67,10 @@ import json
 import logging
 import threading
 import time
+import urllib.error
 import urllib.request
-from typing import Any, Iterable, Mapping
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable, Mapping
 
 from market_tape.config import ConfigError, Feed
 from market_tape.jsonfast import loads as fast_loads
@@ -51,8 +81,35 @@ PUBLIC_USDM_WS = "wss://fstream.binance.com"
 PUBLIC_REST = "https://fapi.binance.com"
 #: The path of each connection group under `ws_url`.
 GROUP_PATHS = {"public": "/stream", "market": "/market/stream"}
-#: `book:1` is `bookTicker`; 5, 10 and 20 are the partial-book streams.
-BOOK_LEVELS = (1, 5, 10, 20)
+#: The diff stream's update speed: `<pair>@depth@100ms`, the full book's increments.
+DIFF_DEPTH_SPEED = "100ms"
+#: A diff stream's name after the pair.
+DIFF_SUFFIX = f"depth@{DIFF_DEPTH_SPEED}"
+#: The diff book's depth on the tape: the level count of the REST snapshot it rides on.
+DIFF_BOOK_LEVELS = 1000
+#: `book:1` is `bookTicker`; 5, 10 and 20 are the partial-book streams; 1000
+#: the diff stream with its REST snapshots.
+BOOK_LEVELS = (1, 5, 10, 20, DIFF_BOOK_LEVELS)
+#: The venue's request weight of one 1000-level `/fapi/v1/depth`, and its
+#: per-IP weight limit a minute, shared by every REST call from the host.
+DEPTH_SNAPSHOT_WEIGHT = 20
+VENUE_WEIGHT_PER_MINUTE = 2_400
+#: What the snapshot lane spends of it: 50 snapshots a minute, leaving the open-interest poll and the table reads the rest.
+SNAPSHOT_WEIGHT_PER_MINUTE = 1_000
+#: Past this share of the venue's minute (its `X-MBX-USED-WEIGHT-1M` header),
+#: the lane waits out the minute: something else on the host is spending it.
+WEIGHT_THROTTLE_FRACTION = 0.75
+#: A 429 or 418 without `Retry-After`: pause the whole lane this long.
+RATE_LIMIT_DEFAULT_SECONDS = 60.0
+#: One symbol's failed snapshot is retried after this, doubling to the maximum.
+SNAPSHOT_RETRY_MIN_SECONDS = 2.0
+SNAPSHOT_RETRY_MAX_SECONDS = 300.0
+#: A snapshot older than its chain's first diff is fetched again after this.
+STALE_SNAPSHOT_RETRY_SECONDS = 1.0
+SNAPSHOT_TIMEOUT_SECONDS = 10.0
+#: The lane's longest wait between looks at `stop` and its requests.
+LANE_POLL_SECONDS = 0.25
+HOUR_NS = 3_600 * 1_000_000_000
 LIQUIDATION_STREAM = "!forceOrder@arr"
 KLINE_INTERVALS = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M")
 #: The streams the `/stream` path carries, by suffix; every other stream rides `/market`.
@@ -121,6 +178,280 @@ def fetch_open_interest(rest_base: str, symbol: str) -> dict[str, Any]:
     return dict(payload)
 
 
+class RateLimited(RuntimeError):
+    """The venue answered 429 (over the weight limit) or 418 (banned for
+    having ignored a 429): every request from the IP waits `retry_after`."""
+
+    def __init__(self, status: int, retry_after: float) -> None:
+        super().__init__(f"HTTP {status}, retry after {retry_after:g}s")
+        self.status = status
+        self.retry_after = retry_after
+
+
+def _header_number(headers: Any, name: str) -> float | None:
+    raw = headers.get(name) if headers is not None else None
+    try:
+        return float(raw) if raw not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_depth(rest_base: str, symbol: str, timeout: float = SNAPSHOT_TIMEOUT_SECONDS) -> tuple[dict[str, Any], int | None]:
+    """One symbol's 1000-level REST book, and the IP's weight used this minute
+    as the venue's `X-MBX-USED-WEIGHT-1M` header states it (None when absent).
+
+    Raises `RateLimited` on 429 and 418, and whatever else the request met."""
+
+    url = f"{rest_base}/fapi/v1/depth?symbol={symbol}&limit={DIFF_BOOK_LEVELS}"
+    request = urllib.request.Request(url, headers={"User-Agent": "market-tape"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            used = _header_number(getattr(response, "headers", None), "X-MBX-USED-WEIGHT-1M")
+            payload = json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        if exc.code in (418, 429):
+            wait = _header_number(exc.headers, "Retry-After")
+            raise RateLimited(exc.code, wait if wait is not None and wait > 0 else RATE_LIMIT_DEFAULT_SECONDS) from exc
+        raise
+    if not isinstance(payload, Mapping) or "lastUpdateId" not in payload:
+        raise RuntimeError(f"venue refused {url}: {str(payload)[:200]}")
+    return dict(payload), None if used is None else int(used)
+
+
+@dataclass
+class DepthSnapshotLane:
+    """The REST snapshots the `book:1000` diff stream rides on, one thread's work.
+
+    The state lives here, on the adapter, and not in the thread: the recorder
+    stops and restarts its lanes whenever the universe changes, and a gap
+    asked for, a symbol in backoff or a minute's spent weight must outlive
+    that. `run_lock` keeps one thread at a time in `run`, so a restart whose
+    old thread is still inside a fetch never has two walking the state.
+
+    Two kinds of work, in this order:
+
+    1. A symbol whose chain gapped, asked for by `request` from the writer
+       thread. The request is taken off `wanted` when its fetch starts, so a
+       gap that arrives while the fetch is in flight puts it back and costs
+       another fetch: that snapshot may land on the tape ahead of the new
+       gap's diff and could not re-base it.
+    2. Once per UTC hour (`hourly`, the config's
+       `connection.reanchor_each_hour`), every diff symbol not yet
+       snapshotted in that hour, in sorted order from the hour boundary, so
+       one hour's tar replays without the hours before it.
+
+    Pacing: one fetch per `60 * DEPTH_SNAPSHOT_WEIGHT / weight_per_minute`
+    seconds, every attempt counted because the venue counts it; past
+    `WEIGHT_THROTTLE_FRACTION` of the venue's minute (what its header says the
+    whole IP has spent) the next fetch waits for the next minute. A 429 or
+    418 pauses the whole lane for `Retry-After`. Any other failure retries
+    that symbol with backoff and moves on to the others. A snapshot older than
+    its chain's first diff could never be bracketed and is not emitted; one
+    the writer's queue had no room for is asked for again. Nothing here
+    raises out of `run`, and `run` returns within `LANE_POLL_SECONDS` of
+    `stop`, or after the fetch in hand (`SNAPSHOT_TIMEOUT_SECONDS`).
+    """
+
+    rest_url: str
+    venue: str = "binance"
+    fetch: Callable[[str, str], tuple[dict[str, Any], int | None]] = fetch_depth
+    wall_ns: Callable[[], int] = time.time_ns
+    monotonic: Callable[[], float] = time.monotonic
+    weight_per_minute: float = SNAPSHOT_WEIGHT_PER_MINUTE
+    hourly: bool = True
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    run_lock: threading.Lock = field(default_factory=threading.Lock)
+    wake: threading.Event = field(default_factory=threading.Event)
+    #: Gapped symbols waiting for a snapshot, oldest request first (under `lock`).
+    wanted: dict[str, None] = field(default_factory=dict)
+    #: Each symbol's current chain's first `U`, written with its request.
+    chain_first: dict[str, int] = field(default_factory=dict)
+    #: The UTC hour (`ns // HOUR_NS`) of each symbol's last emitted snapshot.
+    snapshot_hour: dict[str, int] = field(default_factory=dict)
+    retry_at: dict[str, float] = field(default_factory=dict)
+    failures_in_row: dict[str, int] = field(default_factory=dict)
+    symbols: tuple[str, ...] = ()
+    members: frozenset[str] = frozenset()
+    next_fetch_at: float = 0.0
+    paused_until: float = 0.0
+    throttled_until_ns: int = 0
+    used_weight: int | None = None
+    snapshots: int = 0
+    failures: int = 0
+    stale: int = 0
+    dropped: int = 0
+    rate_limited: int = 0
+
+    # ------------------------------------------------------------ requests
+
+    def request(self, symbol: str, first_update_id: int) -> None:
+        """A chain starting at `first_update_id` needs a snapshot: the writer
+        thread's call, on a gap only, so a clean diff never takes the lock."""
+
+        with self.lock:
+            self.chain_first[symbol] = first_update_id
+            self.wanted[symbol] = None
+        self.wake.set()
+
+    def use(self, symbols: Iterable[str]) -> None:
+        """The diff symbols this lane serves now; the requests of any other are dropped.
+
+        Only here, as a lane starts: the recorder subscribes a new symbol before
+        it restarts the lane, so the outgoing lane meets that symbol's first
+        request and must leave it for its successor."""
+
+        self.symbols = tuple(sorted(set(symbols)))
+        self.members = frozenset(self.symbols)
+        with self.lock:
+            for symbol in [symbol for symbol in self.wanted if symbol not in self.members]:
+                del self.wanted[symbol]
+
+    # ----------------------------------------------------------------- run
+
+    def run(self, symbols: Iterable[str], emit: Emit, stop: threading.Event) -> None:
+        while not self.run_lock.acquire(timeout=LANE_POLL_SECONDS):
+            if stop.is_set():
+                return
+        try:
+            self.use(symbols)
+            while not stop.is_set():
+                try:
+                    delay = self.step(emit)
+                except Exception:  # the lane outlives anything one step meets
+                    logging.exception("binance depth snapshot lane step failed")
+                    delay = 1.0
+                self.wake.wait(max(0.0, min(delay, LANE_POLL_SECONDS)))
+                self.wake.clear()
+        finally:
+            self.run_lock.release()
+
+    @property
+    def spacing_seconds(self) -> float:
+        return 60.0 * DEPTH_SNAPSHOT_WEIGHT / self.weight_per_minute if self.weight_per_minute > 0 else 60.0
+
+    def step(self, emit: Emit) -> float:
+        """Take at most one snapshot; return the seconds until the next could be due."""
+
+        now = self.monotonic()
+        if now < self.paused_until:
+            return self.paused_until - now
+        if now < self.next_fetch_at:
+            return self.next_fetch_at - now
+        symbol, gapped = self._pick(now)
+        if symbol is None:
+            return 1.0
+        self.next_fetch_at = now + self.spacing_seconds
+        try:
+            payload, used = self.fetch(self.rest_url, symbol)
+            received_ns = self.wall_ns()
+            row = self.snapshot_row(symbol, payload, received_ns)
+        except RateLimited as exc:
+            self.rate_limited += 1
+            self.paused_until = self.monotonic() + exc.retry_after
+            self.throttled_until_ns = self.wall_ns() + int(exc.retry_after * 1e9)
+            self._again(symbol, gapped)
+            logging.warning("binance depth snapshots paused %.0fs: %s", exc.retry_after, exc)
+            return exc.retry_after
+        except Exception as exc:  # one symbol's failure is retried; the others go on
+            self.failures += 1
+            count = self.failures_in_row[symbol] = self.failures_in_row.get(symbol, 0) + 1
+            delay = min(SNAPSHOT_RETRY_MIN_SECONDS * 2.0 ** (count - 1), SNAPSHOT_RETRY_MAX_SECONDS)
+            self.retry_at[symbol] = self.monotonic() + delay
+            self._again(symbol, gapped)
+            if count == 1:
+                logging.warning("binance depth snapshot for %s failed, retrying with backoff: %s", symbol, exc)
+            return 0.0
+        self._note_weight(used)
+        self.failures_in_row.pop(symbol, None)
+        self.retry_at.pop(symbol, None)
+        first = self.chain_first.get(symbol)
+        if first is not None and row["update_id"] < first:
+            # The REST answer predates the chain the tape holds: no diff on the
+            # tape can bracket it, so it would only re-base nothing.
+            self.stale += 1
+            self.retry_at[symbol] = self.monotonic() + STALE_SNAPSHOT_RETRY_SECONDS
+            self._again(symbol, gapped)
+            return 0.0
+        if emit(row) is False:
+            self.dropped += 1
+            self._again(symbol, True)
+            return 0.0
+        self.snapshots += 1
+        self.snapshot_hour[symbol] = received_ns // HOUR_NS
+        return 0.0
+
+    def _pick(self, now: float) -> tuple[str | None, bool]:
+        with self.lock:
+            for symbol in list(self.wanted):
+                if symbol not in self.members or self.retry_at.get(symbol, 0.0) > now:
+                    continue
+                del self.wanted[symbol]
+                return symbol, True
+        if not self.hourly:
+            return None, False
+        hour = self.wall_ns() // HOUR_NS
+        for symbol in self.symbols:
+            # A symbol no diff has reached yet is asked for by its first diff.
+            if self.snapshot_hour.get(symbol) == hour or symbol not in self.chain_first:
+                continue
+            if self.retry_at.get(symbol, 0.0) > now:
+                continue
+            return symbol, False
+        return None, False
+
+    def _again(self, symbol: str, gapped: bool) -> None:
+        # An hourly symbol needs nothing: the hour's walk finds it again.
+        if gapped:
+            with self.lock:
+                self.wanted.setdefault(symbol, None)
+
+    def _note_weight(self, used: int | None) -> None:
+        if used is None:
+            return
+        self.used_weight = used
+        if used > WEIGHT_THROTTLE_FRACTION * VENUE_WEIGHT_PER_MINUTE:
+            wall_ns = self.wall_ns()
+            wait = 60.0 - (wall_ns / 1e9) % 60.0
+            self.next_fetch_at = max(self.next_fetch_at, self.monotonic() + wait)
+            self.throttled_until_ns = max(self.throttled_until_ns, wall_ns + int(wait * 1e9))
+
+    def snapshot_row(self, symbol: str, payload: Mapping[str, Any], received_ns: int) -> dict[str, Any]:
+        return typed_book_row(
+            self.venue,
+            symbol,
+            True,  # snapshot
+            DIFF_BOOK_LEVELS,
+            received_ns,
+            0,  # local_receive_mono_ns: no socket read carried it
+            _ns(payload.get("E")),
+            _ns(payload.get("T")),
+            list(payload.get("bids") or []),
+            list(payload.get("asks") or []),
+            int(payload["lastUpdateId"]),
+            0,  # previous_update_id
+            0,  # first_update_id
+            0,  # cross_sequence
+            0,  # previous_cross_sequence
+            False,  # restart_snapshot
+            False,  # sequence_gap
+        )
+
+    def status(self) -> dict[str, Any]:
+        with self.lock:
+            pending = len(self.wanted)
+        return {
+            "symbols": len(self.symbols),
+            "snapshots": self.snapshots,
+            "failures": self.failures,
+            "stale": self.stale,
+            "dropped": self.dropped,
+            "rate_limited": self.rate_limited,
+            "pending": pending,
+            "used_weight_1m": self.used_weight,
+            "throttled_until_ns": self.throttled_until_ns if self.throttled_until_ns > self.wall_ns() else 0,
+        }
+
+
 def _ns(value: Any) -> int:
     try:
         return int(value or 0) * 1_000_000
@@ -169,6 +500,16 @@ class BinanceAdapter:
         self.request_ids = itertools.count(1)
         #: `@trade` types dropped since start, each logged once.
         self.dropped_trade_types: set[str] = set()
+        #: The writer thread's alone: each diff symbol's last `u`, absent until
+        #: its first diff and again after `chain_reset`.
+        self.diff_last_u: dict[str, int] = {}
+        self.depth_snapshots = DepthSnapshotLane(rest_url=self.rest_url, venue=self.name)
+
+    def configure(self, config: Any) -> None:
+        """The recorder's config, once, before any lane starts: the hourly
+        snapshot pass follows `connection.reanchor_each_hour`."""
+
+        self.depth_snapshots.hourly = bool(getattr(config, "reanchor_each_hour", True))
 
     # ---------------------------------------------------------------- feeds
 
@@ -176,7 +517,8 @@ class BinanceAdapter:
         for feed in feeds:
             if feed.name == "book" and feed.levels not in BOOK_LEVELS:
                 raise ConfigError(
-                    f"Binance records book levels {BOOK_LEVELS} (bookTicker and the partial books), not {feed.text}"
+                    f"Binance records book levels {BOOK_LEVELS} (bookTicker, the partial books 5/10/20 "
+                    f"and the 1000-level diff book), not {feed.text}"
                 )
             if feed.name == "kline" and feed.arg not in KLINE_INTERVALS:
                 raise ConfigError(f"Binance kline intervals are {list(KLINE_INTERVALS)}, not {feed.text}")
@@ -189,7 +531,12 @@ class BinanceAdapter:
         for feed in feeds:
             if feed.name == "book":
                 levels = feed.levels
-                result.append(f"{lower}@bookTicker" if levels == 1 else f"{lower}@depth{levels}@100ms")
+                if levels == 1:
+                    result.append(f"{lower}@bookTicker")
+                elif levels == DIFF_BOOK_LEVELS:
+                    result.append(f"{lower}@{DIFF_SUFFIX}")
+                else:
+                    result.append(f"{lower}@depth{levels}@100ms")
             elif feed.name == "trades":
                 result.append(f"{lower}@trade")
             elif feed.name == "ticker":
@@ -211,6 +558,28 @@ class BinanceAdapter:
 
     def anchored_topics(self, topics: Iterable[str]) -> list[str]:
         return []
+
+    def rest_based_topics(self, topics: Iterable[str]) -> list[str]:
+        """The diff books: a gap re-bases them from the REST lane, never by
+        re-subscribing, and a (re)subscribe restarts their chains."""
+
+        return [topic for topic in topics if topic.partition("@")[2] == DIFF_SUFFIX]
+
+    def chain_reset(self, topics: Iterable[str]) -> None:
+        """The writer thread's call, in tape order, before the first frame a
+        (re)subscribe of `topics` can bring: each one's next diff starts a new
+        chain, flagged and snapshotted, whether or not its `pu` happens to
+        meet the last diff seen before the subscribe. Without it a symbol whose
+        `pu` the venue numbers per connection, or that sent nothing across a
+        reconnect, would carry on from a chain the tape cannot vouch for."""
+
+        for topic in topics:
+            pair, _, suffix = topic.partition("@")
+            if suffix == DIFF_SUFFIX:
+                self.diff_last_u.pop(pair.upper(), None)
+
+    def lane_status(self) -> dict[str, Any]:
+        return {"depth_snapshots": self.depth_snapshots.status()}
 
     def connection_url(self, topics: list[str]) -> str:
         groups = {self.connection_group(topic) for topic in topics} or {"public"}
@@ -239,11 +608,23 @@ class BinanceAdapter:
         self, feeds_by_symbol: Mapping[str, tuple[Feed, ...]], emit: Emit, stop: threading.Event
     ) -> list[threading.Thread]:
         by_interval: dict[float, list[str]] = {}
+        diff_symbols: list[str] = []
         for symbol, feeds in feeds_by_symbol.items():
             for feed in feeds:
                 if feed.name == "open_interest":
                     by_interval.setdefault(feed.seconds, []).append(symbol)
+                elif feed.name == "book" and feed.levels == DIFF_BOOK_LEVELS:
+                    diff_symbols.append(symbol)
         threads = []
+        if diff_symbols:
+            thread = threading.Thread(
+                target=self.depth_snapshots.run,
+                args=(diff_symbols, emit, stop),
+                name="tape-binance-depth",
+                daemon=True,
+            )
+            thread.start()
+            threads.append(thread)
         for seconds, symbols in sorted(by_interval.items()):
             thread = threading.Thread(
                 target=self._open_interest_lane,
@@ -367,6 +748,8 @@ class BinanceAdapter:
         if not isinstance(data, dict):
             return []
         suffix = stream.partition("@")[2]
+        if suffix == DIFF_SUFFIX:
+            return self._diff(data, received_ns, received_mono_ns)
         if suffix == "bookTicker":
             return self._top_of_book(data, received_ns, received_mono_ns)
         if suffix == "trade":
@@ -443,6 +826,41 @@ class BinanceAdapter:
                 0,  # previous_cross_sequence
                 False,  # restart_snapshot
                 False,  # sequence_gap
+            )
+        ]
+
+    def _diff(self, data: Mapping[str, Any], received_ns: int, received_mono_ns: int) -> list[dict[str, Any]]:
+        symbol = str(data.get("s") or "").upper()
+        if not symbol:
+            return []
+        update_id = int(data.get("u") or 0)
+        previous = int(data.get("pu") or 0)
+        first = int(data.get("U") or 0)
+        last = self.diff_last_u.get(symbol)
+        # The venue's rule: each diff names the last one's `u` as its `pu`.
+        gap = last is None or previous != last
+        self.diff_last_u[symbol] = update_id
+        if gap:
+            self.depth_snapshots.request(symbol, first)
+        return [
+            typed_book_row(
+                self.name,
+                symbol,
+                False,  # snapshot
+                DIFF_BOOK_LEVELS,
+                received_ns,
+                received_mono_ns,
+                _ns(data.get("E")),
+                _ns(data.get("T")),
+                data.get("b") or [],
+                data.get("a") or [],
+                update_id,
+                previous,
+                first,
+                0,  # cross_sequence
+                0,  # previous_cross_sequence
+                False,  # restart_snapshot
+                gap,
             )
         ]
 
