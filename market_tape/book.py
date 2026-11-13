@@ -35,13 +35,19 @@ What chaining means is the venue's own rule:
 
   An hour replayed alone opens with diffs and no snapshot: the recorder's
   lane takes the hour's snapshots at 50 a minute, ~11 minutes for a full
-  universe, so `HELD_DELTAS` holds 20 minutes of 100 ms diffs.
+  universe, so `HELD_DELTAS` holds 20 minutes of 100 ms diffs. Held and
+  recent diffs are kept packed (`_Diff`): a book holding all 12,000 measures
+  5 MB at 5 levels a side a diff, 11 MB at 20 and 26 MB at 60 (2026-11-13,
+  CPython 3.11), a quarter to a sixth of the rows themselves; a replay that
+  opens on a whole universe's `book:1000` holds on average half of that a
+  book until the hour's snapshots have landed.
 """
 
 from __future__ import annotations
 
+from array import array
 from collections import deque
-from typing import Any
+from typing import Any, Iterator
 
 from market_tape.schema import BookRow
 
@@ -51,6 +57,32 @@ HELD_DELTAS = 12_000
 #: Diffs a good Binance book keeps after applying them, to re-base onto a
 #: snapshot that lands behind them: two minutes of the 100 ms stream.
 RECENT_DELTAS = 1_200
+
+
+class _Diff:
+    """A Binance diff as the book keeps it while it waits or looks back: the
+    ids of the chain rule and the levels as packed doubles, 16 bytes a level
+    where the row's tuples of floats are about 100. A book waiting for its
+    snapshot holds up to `HELD_DELTAS` of these, and a replay of a whole
+    universe holds that for every book at once."""
+
+    __slots__ = ("update_id", "previous_update_id", "first_update_id", "sequence_gap", "_bids", "_asks")
+
+    def __init__(self, row: BookRow) -> None:
+        self.update_id = row.update_id
+        self.previous_update_id = row.previous_update_id
+        self.first_update_id = row.first_update_id
+        self.sequence_gap = row.sequence_gap
+        self._bids = array("d", [value for level in row.bids for value in level])
+        self._asks = array("d", [value for level in row.asks for value in level])
+
+    @property
+    def bids(self) -> Iterator[tuple[float, float]]:
+        return zip(self._bids[::2], self._bids[1::2])
+
+    @property
+    def asks(self) -> Iterator[tuple[float, float]]:
+        return zip(self._asks[::2], self._asks[1::2])
 
 
 class Book:
@@ -65,9 +97,9 @@ class Book:
         self._asks: dict[float, float] = {}
         self._valid = False
         self._awaiting_first_delta = False
-        self._held: deque[BookRow] = deque(maxlen=HELD_DELTAS)
+        self._held: deque[_Diff] = deque(maxlen=HELD_DELTAS)
         #: A good Binance book's applied diffs, newest last, chained up to `last_update_id`.
-        self._recent: deque[BookRow] = deque(maxlen=RECENT_DELTAS)
+        self._recent: deque[_Diff] = deque(maxlen=RECENT_DELTAS)
         #: Binance snapshots that landed on a good book and could not be bracketed, so changed nothing.
         self.snapshots_passed = 0
 
@@ -158,12 +190,13 @@ class Book:
 
     def _take_delta(self, row: BookRow) -> bool:
         if row.venue == "binance":
+            diff = _Diff(row)
             if not self._valid:
-                self._held.append(row)
+                self._held.append(diff)
                 return False
-            applied = self._binance_delta(row)
+            applied = self._binance_delta(diff)
             if not applied and not self._valid:
-                self._held.append(row)
+                self._held.append(diff)
             return applied
         if not self._valid:
             return False
@@ -183,7 +216,7 @@ class Book:
                 self._held.extend(held[index:])
                 return
 
-    def _binance_delta(self, row: BookRow) -> bool:
+    def _binance_delta(self, row: _Diff) -> bool:
         if row.update_id < self.snapshot_update_id:
             return True
         if self._awaiting_first_delta:
@@ -202,7 +235,7 @@ class Book:
         self._recent.append(row)
         return True
 
-    def _change(self, row: BookRow) -> None:
+    def _change(self, row: BookRow | _Diff) -> None:
         for side, changes in ((self._bids, row.bids), (self._asks, row.asks)):
             for price, size in changes:
                 if size > 0:
