@@ -25,7 +25,7 @@ segment_max_mb = 16
 # 64 KiB holds 33 MiB. A bookTicker or @trade row is about 0.5 KB.
 segment_buffer_kb = 16
 # Frames are ~200 B, 81 B more queued (the reader's 25 B event header and
-# `record.QUEUE_EVENT_OVERHEAD_BYTES`): the frame bound binds first, at ~0.27 GiB
+# `recorder.queue.QUEUE_EVENT_OVERHEAD_BYTES`): the frame bound binds first, at ~0.27 GiB
 # and ~3 minutes of the measured rate.
 queue_frames = 1048576
 # Half of the unit's MemoryMax=1G, as on the Bybit recorder: the reader's

@@ -71,7 +71,7 @@ _NOT_A_FIELD = frozenset({"ts_ms", "realm", "kind", "state", "error", "tape"})
 #: The byte meter's feed classes, as `lm_tape_bytes_24h_<class>`. A class the
 #: recorder reports outside this list is summed into `other`.
 _FEED_CLASSES = ("book", "trades", "ticker", "liquidations", "kline", "control")
-#: The feed classes whose clocks `status.json` `clock.feeds` reads (`market_tape/record.py::CLOCK_FEEDS`).
+#: The feed classes whose clocks `status.json` `clock.feeds` reads (`market_tape/recorder/clocks.py::CLOCK_FEEDS`).
 _CLOCK_FEEDS = ("book", "trades")
 #: `<key in the upload stamp>` -> `<lm_tape field>`.
 _UPLOAD_STAMP_FIELDS = {

@@ -55,6 +55,7 @@ from websockets.frames import Frame, Opcode
 from websockets.server import ServerProtocol
 
 from market_tape import pack, reader, record, storage
+from market_tape.recorder import shard as shard_module
 from market_tape.config import CaptureConfig, Feed, StorageSettings, Tier, Universe, VenueSettings
 from market_tape.record import Recorder
 from market_tape.venues.bybit import BybitAdapter
@@ -653,9 +654,9 @@ def run_burst_day(
     monkeypatch.setattr(reader, "READ_BUFFER_BYTES", READ_BUFFER_BYTES)
     monkeypatch.setattr(reader, "QUEUE_PUT_TIMEOUT_SECONDS", 0.25)
     monkeypatch.setattr(reader, "SOCKET_QUEUE_FRAMES", script.read_ahead)
-    monkeypatch.setattr(record, "random", random.Random(seed))
-    monkeypatch.setattr(record, "RECONNECT_BACKOFF_MIN_SECONDS", 0.3)
-    monkeypatch.setattr(record, "RECONNECT_HEALTHY_SECONDS", 0.5)
+    monkeypatch.setattr(shard_module, "random", random.Random(seed))
+    monkeypatch.setattr(shard_module, "RECONNECT_BACKOFF_MIN_SECONDS", 0.3)
+    monkeypatch.setattr(shard_module, "RECONNECT_HEALTHY_SECONDS", 0.5)
     monkeypatch.setattr(time, "time_ns", host.time_ns)
     monkeypatch.setattr(os, "fsync", host.fsync)
     monkeypatch.setattr(shutil, "disk_usage", host.disk_usage)
@@ -920,7 +921,7 @@ def assert_burst_day(outcome: dict[str, Any], script: Script) -> None:
     # The venue's drop was not answered all at once, nor retried in a storm.
     reopened = sorted(at for at, _ in venue.connects if at >= observed.phases["reopen"])[: outcome["shards"]]
     assert len(reopened) == outcome["shards"]
-    assert reopened[-1] - reopened[0] >= 0.1 * record.RECONNECT_BACKOFF_MIN_SECONDS, "every shard reconnected at once"
+    assert reopened[-1] - reopened[0] >= 0.1 * shard_module.RECONNECT_BACKOFF_MIN_SECONDS, "every shard reconnected at once"
     attempts = [at for at in venue.refused_attempts if observed.phases["outage"] <= at <= observed.phases["reopen"]]
     # Backoff doubles from 0.3 s: over the outage a shard tries a handful of times.
     assert len(attempts) <= outcome["shards"] * 4, f"{len(attempts)} refused attempts from {outcome['shards']} shards"

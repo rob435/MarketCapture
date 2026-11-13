@@ -36,6 +36,7 @@ from market_tape.config import (
     parse_config,
 )
 from market_tape import reader, record, storage
+from market_tape.recorder import core, intake, shard as shard_module
 from market_tape.record import BudgetController, ByteMeter, Recorder, Shard, shard_topics
 from market_tape.schema import SCHEMA_VERSION
 from market_tape.venues.bybit import BybitAdapter
@@ -729,7 +730,7 @@ def test_two_gapped_topics_go_one_at_a_time_at_the_venues_message_spacing(tmp_pa
         book_frame("delta", 102, depth=1),
     )
     paused: list[float] = []
-    monkeypatch.setattr(record.time, "sleep", paused.append)
+    monkeypatch.setattr(time, "sleep", paused.append)
     recorder._resync_books()
 
     assert [json.loads(text)["args"] for text in socket.sent] == [
@@ -1233,7 +1234,7 @@ def test_a_disk_under_the_free_floor_prunes_now_instead_of_waiting_out_the_inter
     recorder.adapter.fetch_tables = refuse  # type: ignore[method-assign]
     monkeypatch.setattr(recorder, "_reconcile_tier", lambda name, topics: None)
     # Long enough that a pass inside it can only come from the wake, never the clock.
-    monkeypatch.setattr(record, "RETENTION_INTERVAL_SECONDS", 3600.0)
+    monkeypatch.setattr(core, "RETENTION_INTERVAL_SECONDS", 3600.0)
 
     started = threading.Event()
     woken = threading.Event()
@@ -1341,7 +1342,7 @@ def test_a_pass_that_deletes_and_leaves_the_gate_shut_passes_again_at_once(
 
     recorder = build(tmp_path, Tier("deep", (Feed("trades"),), Universe("symbols", symbols=("BTCUSDT",))))
     # Long enough that a second pass inside it can only come from the first.
-    monkeypatch.setattr(record, "RETENTION_INTERVAL_SECONDS", 3600.0)
+    monkeypatch.setattr(core, "RETENTION_INTERVAL_SECONDS", 3600.0)
     # What a crossing leaves behind, and the developer box's own free space
     # pinned under the floor so `writable()` reads the code under test.
     recorder.disk_blocked = True
@@ -1397,7 +1398,7 @@ def test_a_burst_of_owed_passes_deletes_the_deficit_once_not_the_whole_tape(
 
     recorder = build(tmp_path, Tier("deep", (Feed("trades"),), Universe("symbols", symbols=("BTCUSDT",))))
     # Long enough that every pass inside the burst comes from the burst itself.
-    monkeypatch.setattr(record, "RETENTION_INTERVAL_SECONDS", 3600.0)
+    monkeypatch.setattr(core, "RETENTION_INTERVAL_SECONDS", 3600.0)
     recorder.retention.retention_days = 36_500
     recorder.retention.max_bytes = 10**12
     recorder.retention.min_free_bytes = 400
@@ -1464,7 +1465,7 @@ def test_a_blocked_tick_runs_the_pass_the_credited_burst_stopped_short_of(
     recorder.adapter.fetch_tables = refuse  # type: ignore[method-assign]
     monkeypatch.setattr(recorder, "_reconcile_tier", lambda name, topics: None)
     # Long enough that a pass inside it can only come from a wake, never the clock.
-    monkeypatch.setattr(record, "RETENTION_INTERVAL_SECONDS", 3600.0)
+    monkeypatch.setattr(core, "RETENTION_INTERVAL_SECONDS", 3600.0)
     recorder.retention.retention_days = 36_500
     recorder.retention.max_bytes = 10**12
     recorder.retention.min_free_bytes = 400
@@ -1907,8 +1908,8 @@ def test_continuous_frames_close_a_quiet_symbols_previous_hour(
 
     closed: list[Any] = []
     monkeypatch.setattr(recorder.frames, "get_batch", lambda max_items, timeout: [receive(timeout)])
-    monkeypatch.setattr(record.time, "time_ns", lambda: clock["wall"])
-    monkeypatch.setattr(record.time, "monotonic_ns", lambda: clock["elapsed"])
+    monkeypatch.setattr(time, "time_ns", lambda: clock["wall"])
+    monkeypatch.setattr(time, "monotonic_ns", lambda: clock["elapsed"])
     monkeypatch.setattr(recorder.compressor, "submit", closed.append)
     try:
         recorder._write_loop()
@@ -1943,7 +1944,7 @@ def test_the_hour_roll_writes_the_recorders_own_account_of_the_hour(
     shard = unstarted_shard(recorder, "deep", topics)
     recorder.tier_shards["deep"] = [shard]
     clock = {"now": BASE_NS}
-    monkeypatch.setattr(record.time, "time_ns", lambda: clock["now"])
+    monkeypatch.setattr(time, "time_ns", lambda: clock["now"])
     # The fold opens on the process's own start; this one opens on the test's hour.
     recorder.coverage = CoverageFold(
         venue="bybit",
@@ -2183,8 +2184,8 @@ def test_a_backlog_drained_past_the_hour_closes_each_of_its_segments_once(
 
     closed: list[Any] = []
     monkeypatch.setattr(recorder.frames, "get_batch", lambda max_items, timeout: [receive(timeout)])
-    monkeypatch.setattr(record.time, "time_ns", lambda: BASE_NS + HOUR_NS + 20 * 60 * 10**9)
-    monkeypatch.setattr(record.time, "monotonic_ns", lambda: clock["mono"])
+    monkeypatch.setattr(time, "time_ns", lambda: BASE_NS + HOUR_NS + 20 * 60 * 10**9)
+    monkeypatch.setattr(time, "monotonic_ns", lambda: clock["mono"])
     monkeypatch.setattr(recorder.compressor, "submit", closed.append)
     try:
         recorder._write_loop()
@@ -2218,8 +2219,8 @@ def test_a_drained_quiet_recorder_closes_the_hour_soon_after_it_ends(
 
     closed_at: list[int] = []
     monkeypatch.setattr(recorder.frames, "get_batch", lambda max_items, timeout: [receive(timeout)])
-    monkeypatch.setattr(record.time, "time_ns", lambda: clock["wall"])
-    monkeypatch.setattr(record.time, "monotonic_ns", lambda: clock["mono"])
+    monkeypatch.setattr(time, "time_ns", lambda: clock["wall"])
+    monkeypatch.setattr(time, "monotonic_ns", lambda: clock["mono"])
     monkeypatch.setattr(recorder.compressor, "submit", lambda _segment: closed_at.append(clock["wall"]))
     recorder._write_loop()
 
@@ -2430,7 +2431,7 @@ def test_a_wall_clock_step_during_a_connection_does_not_reset_the_backoff(
             return True
 
     shard.stop = OneWait()
-    monkeypatch.setattr(record.time, "time_ns", lambda: wall["ns"])
+    monkeypatch.setattr(time, "time_ns", lambda: wall["ns"])
     monkeypatch.setattr(shard, "_connect_once", connect_while_the_clock_steps)
     shard._run()
 
@@ -2452,7 +2453,7 @@ def test_an_idle_roll_that_raises_leaves_the_writer_writing(tmp_path: Path, monk
 
     monkeypatch.setattr(recorder.writer, "roll_idle", broken_roll)
     monkeypatch.setattr(recorder.frames, "get_batch", one_at_a_time)
-    monkeypatch.setattr(record.time, "monotonic_ns", lambda: clock["mono"])
+    monkeypatch.setattr(time, "monotonic_ns", lambda: clock["mono"])
     try:
         recorder._write_loop()
         assert recorder.written_rows == 3
@@ -2574,8 +2575,8 @@ def test_a_reader_that_exits_unasked_ends_its_links_and_every_shard_reconnects_t
         except Exception:  # the reader went away
             return
 
-    monkeypatch.setattr(record, "RECONNECT_BACKOFF_MIN_SECONDS", 0.2)
-    monkeypatch.setattr(record, "READER_RESPAWN_SECONDS", 0.1)
+    monkeypatch.setattr(shard_module, "RECONNECT_BACKOFF_MIN_SECONDS", 0.2)
+    monkeypatch.setattr(intake, "READER_RESPAWN_SECONDS", 0.1)
     with serve(ticking, "127.0.0.1", 0) as server:
         threading.Thread(target=server.serve_forever, daemon=True).start()
         port = server.socket.getsockname()[1]

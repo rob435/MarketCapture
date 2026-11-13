@@ -1,7 +1,8 @@
 """The capture reader: every shard's websocket, read in a process of its own.
 
-The recorder (`market_tape.record`) starts one reader beside itself
-(`python -m market_tape.reader`) and speaks to it over two pipes. The reader
+The recorder (`market_tape.record`; its side is `market_tape/recorder/intake.py`)
+starts one reader beside itself (`python -m market_tape.reader`) and speaks
+to it over two pipes. The reader
 owns every socket: it connects, completes TLS and the websocket handshake,
 sends what the recorder asks, keeps each connection alive, reads every frame,
 stamps it, and hands the frames back through the events pipe. It parses no
@@ -100,7 +101,7 @@ QUEUE_PUT_TIMEOUT_SECONDS = 5.0
 EVENTS_BUFFER_BYTES = 1024 * 1024
 #: The events pipe takes at most one write this often, unless the events
 #: waiting fill `EVENTS_FLUSH_BYTES`: a write a pass was a syscall a pass,
-#: and the recorder takes them on its own tick (`record.INTAKE_TICK_SECONDS`).
+#: and the recorder takes them on its own tick (`market_tape/recorder/intake.py::INTAKE_TICK_SECONDS`).
 #: A pass after a quiet spell writes at once. Frames carry their stamps, so
 #: this delays the queue and never the tape's clocks; a stopping reader
 #: writes at once.

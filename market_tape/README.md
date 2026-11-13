@@ -8,7 +8,7 @@ Records one venue's public market data per process, compresses it, ships hourly 
 
 | Verb | Contract |
 | :--- | :--- |
-| `record` | `market_tape/record.py` (processes, threads, queue, budget, lock) |
+| `record` | `market_tape/record.py` (processes, threads, module map); `market_tape/recorder/queue.py` (queue), `budget.py` (budget), `core.py` (lock, `_meta` and retention threads) |
 | `coverage` | `market_tape/coverage.py` (cell statuses, reason codes); the recorder's account of each hour |
 | `quality` | `market_tape/quality.py` (every column, the clock-step rule); the rows' own account |
 | `pack` | `market_tape/pack.py` (hours, index, upload, box ledger, sliding window, recovery on an idle root) |
@@ -33,7 +33,7 @@ Records one venue's public market data per process, compresses it, ships hourly 
 
 Root layout, segment lifecycle and durability: `market_tape/storage.py` docstring. Also under the root: `<day>/<HH>/_meta/coverage-<HH>-<stamp>.json.zst` (the coverage record); `manifest.jsonl`: a receipt per file the root holds (`segment_compressed`, `snapshot_compressed`, `coverage_compressed`, `segment_blocks`), its `sha256` the file's content digest, which a reader may take as the file's fingerprint, and a row per file deleted (`segment_deleted`, `snapshot_deleted`), rewritten to the live receipts on a retention pass (`market_tape/storage.py::Manifest`); `status.json` every `status_interval_seconds`. `pack` ships only `<day>/<HH>/`. Any writer that keeps this layout, one coverage record an hour, is read by every verb as a recorder root.
 
-* `status.json`: a watchdog reads its mtime and `last_receive_ns`, measuring from `started_at_ns`. Also `dropped_frames`, `disk_dropped_frames`, `queued_*`, `shards[]` (`reanchors`, `resyncs`, `link`: the reader's last `STATS` of the connection, `market_tape/reader.py` docstring), `budget`, `compressor` (`failed`, `deferred`), `clock` (receipt less the venue's send stamp, `market_tape/record.py::Recorder::_clock_status`), `queue_wait`, `fast_json` (`orjson` present), and tier membership. The tick that writes it never walks the tape or fsyncs.
+* `status.json`: a watchdog reads its mtime and `last_receive_ns`, measuring from `started_at_ns`. Also `dropped_frames`, `disk_dropped_frames`, `queued_*`, `shards[]` (`reanchors`, `resyncs`, `link`: the reader's last `STATS` of the connection, `market_tape/reader.py` docstring), `budget`, `compressor` (`failed`, `deferred`), `clock` (receipt less the venue's send stamp, `market_tape/recorder/core.py::Recorder::_clock_status`), `queue_wait`, `fast_json` (`orjson` present), and tier membership. The tick that writes it never walks the tape or fsyncs.
 * A thin name's segment reads 0 bytes until its write buffer fills.
 * Capture queue: bounded by `storage.queue_frames` and `storage.queue_max_mb`; a shard without room under both for `market_tape/reader.py::QUEUE_PUT_TIMEOUT_SECONDS` overruns (`dropped_frames`) and reconnects for fresh snapshots.
 * Every Bybit book and ticker topic is re-subscribed once per UTC hour (`connection.reanchor_each_hour`), so every hour replays alone; the seam falls on funding settlement and loses one round trip of deltas. Binance's whole-book rows (`book:1` to `book:20`) and tickers need none; its `book:1000` is re-based by a REST snapshot per symbol each hour instead, with no re-subscribe and no seam (`market_tape/venues/binance.py::DepthSnapshotLane`, `status.json` `lanes_status`).
@@ -56,7 +56,7 @@ Frames from one socket read share its stamp. `exchange_system_ts_ns`: gateway se
 
 ### Book sequence contract (Bybit)
 
-Shared by a live feed, `market_tape/venues/bybit.py` and `market_tape/record.py` (recorder), and `market_tape/book.py` (rebuild); pinned by `tests/fixtures/bybit_orderbook_sequence.jsonl`, which `tests/market_tape/test_bybit_sequence.py` reads.
+Shared by a live feed, `market_tape/venues/bybit.py` and `market_tape/recorder/core.py` (recorder), and `market_tape/book.py` (rebuild); pinned by `tests/fixtures/bybit_orderbook_sequence.jsonl`, which `tests/market_tape/test_bybit_sequence.py` reads.
 
 | Frame on one topic | Live | Recorder | Rebuild |
 | :--- | :--- | :--- | :--- |
@@ -67,7 +67,7 @@ Shared by a live feed, `market_tape/venues/bybit.py` and `market_tape/record.py`
 
 ### Book sequence contract (Binance `book:1000`)
 
-Shared by `market_tape/venues/binance.py` (adapter and `DepthSnapshotLane`), `market_tape/record.py` (recorder) and `market_tape/book.py` (rebuild); pinned by `tests/market_tape/test_binance_depth.py` and `tests/market_tape/test_book.py`, against local fakes only (the venue answers this sandbox 451).
+Shared by `market_tape/venues/binance.py` (adapter and `DepthSnapshotLane`), `market_tape/recorder/core.py` (recorder) and `market_tape/book.py` (rebuild); pinned by `tests/market_tape/test_binance_depth.py` and `tests/market_tape/test_book.py`, against local fakes only (the venue answers this sandbox 451).
 
 | Event on one symbol | Recorder | Rebuild |
 | :--- | :--- | :--- |
