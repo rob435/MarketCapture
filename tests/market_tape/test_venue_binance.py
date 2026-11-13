@@ -153,9 +153,11 @@ def test_the_venue_refuses_what_it_cannot_record() -> None:
     adapter.validate_feeds(
         feeds("book:1", "book:5", "book:10", "book:20", "book:1000", "trades", "ticker", "kline:1M", "open_interest:60")
     )
+    # Every hourly REST lane feed, tardis.dev's binance-futures statistics among them.
+    adapter.validate_feeds(feeds("funding", "account_ratio", "top_account_ratio", "top_position_ratio", "taker_volume"))
     with pytest.raises(ConfigError, match=r"the 1000-level diff book\), not book:50"):
         adapter.validate_feeds(feeds("book:50"))
-    for text in ("book:50", "book:500", "kline:5s", "funding", "account_ratio"):
+    for text in ("book:50", "book:500", "kline:5s"):
         with pytest.raises(ConfigError):
             adapter.validate_feeds(feeds(text))
 

@@ -87,3 +87,19 @@ universe = { kind = "listed", quote = "USDT" }
 # name = "full_book"
 # feeds = ["book:1000"]
 # universe = { kind = "symbols", symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"] }
+#
+# The hourly REST lanes (market_tape/venues/binance_rest.py): settled funding
+# and the four five-minute trading statistics tardis.dev records for
+# binance-futures, not recorded here until the owner says so. Not measured
+# (this host's region was not tried; the build sandbox gets 451); sized from
+# the docs: per ~530 names an hour, ~2,650 requests in one ~27-minute walk
+# three minutes past the hour, at most 60 % of each endpoint's per-IP limit
+# (`/fapi/v1/fundingRate` 500 / 5 min, `/futures/data/*` 1,000 / 5 min, limits
+# of their own beside the IP's 2,400 weight a minute); ~25,500 rows of
+# ~170 B JSON (~4.3 MB raw an hour, well under 1 GB a month compressed); and
+# ~5 MB an hour inbound, nothing beside the budget above. Rows join each
+# symbol's own segment. A 429 or 418 on any lane pauses every lane for its
+# Retry-After (`status.json` `lanes_status.rest_budget`). On the existing tier
+# it would read:
+#
+# feeds = ["book:1", "trades", "funding", "account_ratio", "top_account_ratio", "top_position_ratio", "taker_volume"]

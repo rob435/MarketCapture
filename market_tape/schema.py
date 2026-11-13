@@ -9,10 +9,13 @@ read every schema a stored row carries.
 Every row carries its `venue` and `symbol`. A book row's `first_update_id` is
 the venue's first id of the update (Binance `U`; 0 elsewhere) and
 `previous_update_id` the venue's own previous id when it publishes one
-(Binance `pu`), else the recorder's view of the row before. Two row kinds the
-venue serves over REST rather than a stream join the symbol's segment,
-`funding_settlement` (one settled funding payment) and `account_ratio` (one
-long/short account-ratio bucket). A stream row (book, trade, ticker,
+(Binance `pu`), else the recorder's view of the row before. Row kinds the
+venue serves over REST rather than a stream join the symbol's segment:
+`funding_settlement` (one settled funding payment), `account_ratio` (one
+long/short account-ratio bucket over all accounts), and, from Binance only,
+`top_account_ratio` and `top_position_ratio` (the same split over the top
+traders' accounts and positions) and `taker_volume` (one bucket's taker buy
+and sell volume). A stream row (book, trade, ticker,
 liquidation, kline) may lack `local_receive_mono_ns`, and a trade row
 `exchange_system_ts_ns`; absent, both read as 0.
 
@@ -54,6 +57,11 @@ KIND_KLINE = "kline"
 #: lane once an hour, and written into the symbol's own segment like any row.
 KIND_FUNDING = "funding_settlement"
 KIND_ACCOUNT_RATIO = "account_ratio"
+KIND_TOP_ACCOUNT_RATIO = "top_account_ratio"
+KIND_TOP_POSITION_RATIO = "top_position_ratio"
+KIND_TAKER_VOLUME = "taker_volume"
+#: The REST lane kinds whose feed is named as the kind is.
+LANE_KINDS_BY_FEED = (KIND_ACCOUNT_RATIO, KIND_TOP_ACCOUNT_RATIO, KIND_TOP_POSITION_RATIO, KIND_TAKER_VOLUME)
 
 SNAPSHOT_INSTRUMENTS = "instruments_snapshot"
 SNAPSHOT_TICKERS = "tickers_snapshot"
@@ -355,8 +363,54 @@ def account_ratio_row(
     which sum to one. Positioning, not size: a thousand small longs and one
     large short read as a crowd long."""
 
+    return _ratio_row(KIND_ACCOUNT_RATIO, venue, symbol, local_receive_ts_ns, period, ts_ms, buy_ratio, sell_ratio)
+
+
+def top_account_ratio_row(
+    *,
+    venue: str,
+    symbol: str,
+    local_receive_ts_ns: int,
+    period: str,
+    ts_ms: int,
+    buy_ratio: float,
+    sell_ratio: float,
+) -> dict[str, Any]:
+    """`account_ratio_row` over the venue's top traders only (Binance: the top
+    20% of accounts by margin balance): the share of those accounts net long
+    and net short."""
+
+    return _ratio_row(KIND_TOP_ACCOUNT_RATIO, venue, symbol, local_receive_ts_ns, period, ts_ms, buy_ratio, sell_ratio)
+
+
+def top_position_ratio_row(
+    *,
+    venue: str,
+    symbol: str,
+    local_receive_ts_ns: int,
+    period: str,
+    ts_ms: int,
+    buy_ratio: float,
+    sell_ratio: float,
+) -> dict[str, Any]:
+    """The top traders' long and short positions as shares of their whole
+    position in the symbol: size, where the account ratios count heads."""
+
+    return _ratio_row(KIND_TOP_POSITION_RATIO, venue, symbol, local_receive_ts_ns, period, ts_ms, buy_ratio, sell_ratio)
+
+
+def _ratio_row(
+    kind: str,
+    venue: str,
+    symbol: str,
+    local_receive_ts_ns: int,
+    period: str,
+    ts_ms: int,
+    buy_ratio: float,
+    sell_ratio: float,
+) -> dict[str, Any]:
     return {
-        "kind": KIND_ACCOUNT_RATIO,
+        "kind": kind,
         "venue": venue,
         "symbol": symbol,
         "local_receive_ts_ns": int(local_receive_ts_ns),
@@ -367,9 +421,36 @@ def account_ratio_row(
     }
 
 
+def taker_volume_row(
+    *,
+    venue: str,
+    symbol: str,
+    local_receive_ts_ns: int,
+    period: str,
+    ts_ms: int,
+    buy_volume: float,
+    sell_volume: float,
+) -> dict[str, Any]:
+    """The volume taker buys and taker sells traded in one `period` bucket
+    stamped `ts_ms`, as the venue states them. The venue's own buy/sell ratio
+    is their quotient and is not stored."""
+
+    return {
+        "kind": KIND_TAKER_VOLUME,
+        "venue": venue,
+        "symbol": symbol,
+        "local_receive_ts_ns": int(local_receive_ts_ns),
+        "period": str(period),
+        "ts_ms": int(ts_ms),
+        "buy_volume": float(buy_volume),
+        "sell_volume": float(sell_volume),
+    }
+
+
 def feed_of_row(row: Mapping[str, Any]) -> str:
     """The feed a row belongs to (`book:50`, `trades`, `ticker`, `liquidations`,
-    `kline:1`), as a tier names it; `""` for a kind no feed asks for."""
+    `kline:1`, `funding`, `account_ratio`, ...), as a tier names it; `""` for a
+    kind no feed asks for."""
 
     kind = row.get("kind")
     if kind in (KIND_BOOK_SNAPSHOT, KIND_BOOK_DELTA):
@@ -384,8 +465,8 @@ def feed_of_row(row: Mapping[str, Any]) -> str:
         return f"kline:{row.get('interval')}"
     if kind == KIND_FUNDING:
         return "funding"
-    if kind == KIND_ACCOUNT_RATIO:
-        return "account_ratio"
+    if kind in LANE_KINDS_BY_FEED:
+        return str(kind)
     return ""
 
 
@@ -582,7 +663,64 @@ class AccountRatioRow:
     kind = KIND_ACCOUNT_RATIO
 
 
-Row = Union[BookRow, TradeRow, TickerRow, LiquidationRow, KlineRow, FundingRow, AccountRatioRow]
+@dataclass(frozen=True, slots=True)
+class TopAccountRatioRow:
+    venue: str
+    symbol: str
+    local_receive_ts_ns: int
+    period: str
+    ts_ms: int
+    buy_ratio: float
+    sell_ratio: float
+
+    kind = KIND_TOP_ACCOUNT_RATIO
+
+
+@dataclass(frozen=True, slots=True)
+class TopPositionRatioRow:
+    venue: str
+    symbol: str
+    local_receive_ts_ns: int
+    period: str
+    ts_ms: int
+    buy_ratio: float
+    sell_ratio: float
+
+    kind = KIND_TOP_POSITION_RATIO
+
+
+@dataclass(frozen=True, slots=True)
+class TakerVolumeRow:
+    venue: str
+    symbol: str
+    local_receive_ts_ns: int
+    period: str
+    ts_ms: int
+    buy_volume: float
+    sell_volume: float
+
+    kind = KIND_TAKER_VOLUME
+
+
+Row = Union[
+    BookRow,
+    TradeRow,
+    TickerRow,
+    LiquidationRow,
+    KlineRow,
+    FundingRow,
+    AccountRatioRow,
+    TopAccountRatioRow,
+    TopPositionRatioRow,
+    TakerVolumeRow,
+]
+#: The typed rows of the REST lane kinds: fetched after the fact, stamped by the venue's bucket.
+LANE_ROW_TYPES = (FundingRow, AccountRatioRow, TopAccountRatioRow, TopPositionRatioRow, TakerVolumeRow)
+_RATIO_ROW_TYPES: dict[str, type[AccountRatioRow] | type[TopAccountRatioRow] | type[TopPositionRatioRow]] = {
+    KIND_ACCOUNT_RATIO: AccountRatioRow,
+    KIND_TOP_ACCOUNT_RATIO: TopAccountRatioRow,
+    KIND_TOP_POSITION_RATIO: TopPositionRatioRow,
+}
 
 
 def _int(obj: Mapping[str, Any], name: str, default: int | None = 0) -> int:
@@ -741,8 +879,9 @@ def parse_row(obj: Mapping[str, Any]) -> Row:
             funding_time_ms=_int(obj, "funding_time_ms", None),
             funding_rate=_number(obj, "funding_rate"),
         )
-    if kind == KIND_ACCOUNT_RATIO:
-        return AccountRatioRow(
+    ratio_type = _RATIO_ROW_TYPES.get(str(kind))
+    if ratio_type is not None:
+        return ratio_type(
             venue=venue,
             symbol=symbol,
             local_receive_ts_ns=received,
@@ -750,5 +889,15 @@ def parse_row(obj: Mapping[str, Any]) -> Row:
             ts_ms=_int(obj, "ts_ms", None),
             buy_ratio=_number(obj, "buy_ratio"),
             sell_ratio=_number(obj, "sell_ratio"),
+        )
+    if kind == KIND_TAKER_VOLUME:
+        return TakerVolumeRow(
+            venue=venue,
+            symbol=symbol,
+            local_receive_ts_ns=received,
+            period=str(obj.get("period") or ""),
+            ts_ms=_int(obj, "ts_ms", None),
+            buy_volume=_number(obj, "buy_volume"),
+            sell_volume=_number(obj, "sell_volume"),
         )
     raise SchemaError(f"unknown row kind {kind!r}")

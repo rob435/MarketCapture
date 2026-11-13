@@ -484,8 +484,9 @@ def test_the_lane_survives_its_failures_and_ends_when_stopped() -> None:
     lane.request("BTCUSDT", 1)
     thread = threading.Thread(target=lane.run, args=(["BTCUSDT"], rows.append, stop), daemon=True)
     thread.start()
-    time.sleep(0.3)
-    assert thread.is_alive() and lane.failures >= 1
+    # Waited for, not slept for: a loaded host may start the thread late.
+    assert _wait(lambda: lane.failures >= 1, 10.0)
+    assert thread.is_alive()
     started = time.monotonic()
     stop.set()
     thread.join(2.0)
@@ -801,6 +802,12 @@ def _wait(condition: Callable[[], bool], seconds: float) -> bool:
 def test_the_recorder_records_the_full_book_and_heals_a_lost_diff_with_a_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Every assertion below is about one UTC hour: a run that crossed a
+    # boundary would split the gaps across two coverage records and take the
+    # new hour's re-anchoring snapshots. Start clear of one.
+    seconds_left = 3_600 - time.time() % 3_600
+    if seconds_left < 60:
+        time.sleep(seconds_left + 1)
     venue = DiffVenue()
     threading.Thread(target=venue.engine, daemon=True).start()
     rest = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _rest_handler(venue))
@@ -824,14 +831,22 @@ def test_the_recorder_records_the_full_book_and_heals_a_lost_diff_with_a_snapsho
             monkeypatch.setattr(recorder, "_install_signals", lambda: None)
             outcome: dict[str, bool] = {}
 
+            lane = adapter.depth_snapshots
+
             def script() -> None:
                 # Based once from the connect's gap, then a diff lost on the
-                # wire, healed by the snapshot that gap asks for.
-                outcome["based"] = _wait(lambda: all(len(venue.snapshots.get(symbol, [])) >= 1 for symbol in SYMBOLS), 20.0)
-                time.sleep(0.4)
+                # wire, healed by the snapshot that gap asks for. Each wait is
+                # for the snapshot handed to the writer (`snapshot_hour`,
+                # `snapshots`), not for the venue having served it: the queue
+                # is the tape's order and shutdown drains it, whereas a fixed
+                # sleep after the venue answered let a starved lane thread
+                # queue the basing snapshot behind the lost diff.
+                outcome["based"] = _wait(lambda: all(symbol in lane.snapshot_hour for symbol in SYMBOLS), 20.0)
                 venue.drop.add("BTCUSDT")
-                outcome["healed"] = _wait(lambda: len(venue.snapshots.get("BTCUSDT", [])) >= 2, 20.0)
-                time.sleep(0.6)
+                outcome["healed"] = _wait(lambda: "BTCUSDT" in venue.dropped_u and lane.snapshots >= 3, 20.0)
+                # A tail of diffs past the heal, so the book is checked chaining on from it.
+                streamed = venue.streamed.get("BTCUSDT", 0)
+                _wait(lambda: venue.streamed.get("BTCUSDT", 0) >= streamed + 20, 5.0)
                 recorder.stop.set()
 
             threading.Thread(target=script, daemon=True).start()

@@ -221,6 +221,16 @@ def test_a_feed_bybit_does_not_publish_is_refused() -> None:
         adapter.validate_feeds([parse_feed("kline:2m")])
 
 
+def test_the_lane_feeds_only_binance_publishes_are_refused_by_name() -> None:
+    adapter = BybitAdapter()
+    adapter.validate_feeds([parse_feed("funding"), parse_feed("account_ratio")])
+    for text in ("top_account_ratio", "top_position_ratio", "taker_volume"):
+        with pytest.raises(ConfigError, match=f"Bybit publishes no {text} history; its REST lane records funding and account_ratio"):
+            adapter.validate_feeds([parse_feed(text)])
+    # They name no stream either: a Bybit adapter asked for one subscribes nothing.
+    assert adapter.topics("AGIUSDT", [parse_feed("taker_volume")]) == []
+
+
 def test_topics_are_subscribed_ten_at_a_time() -> None:
     adapter = BybitAdapter()
     topics = [f"tickers.SYM{index}USDT" for index in range(25)]

@@ -105,6 +105,9 @@ def test_a_row_needs_a_kind_a_venue_a_symbol_and_a_receive_clock() -> None:
         ("kline", {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 3.0, "turnover": 4.0}, "low"),
         ("funding_settlement", {"funding_time_ms": 1, "funding_rate": 0.0001}, "funding_rate"),
         ("account_ratio", {"ts_ms": 1, "period": "5min", "buy_ratio": 0.6, "sell_ratio": 0.4}, "sell_ratio"),
+        ("top_account_ratio", {"ts_ms": 1, "period": "5min", "buy_ratio": 0.6, "sell_ratio": 0.4}, "buy_ratio"),
+        ("top_position_ratio", {"ts_ms": 1, "period": "5min", "buy_ratio": 0.6, "sell_ratio": 0.4}, "sell_ratio"),
+        ("taker_volume", {"ts_ms": 1, "period": "5min", "buy_volume": 6.0, "sell_volume": 4.0}, "buy_volume"),
     ],
 )
 def test_a_number_a_row_always_carries_is_never_read_as_zero(kind: str, fields: dict, dropped: str) -> None:
@@ -170,6 +173,44 @@ def test_a_settled_funding_payment_and_an_account_ratio_bucket_round_trip() -> N
         parse_row({k: v for k, v in funding.items() if k != "funding_time_ms"})
     with pytest.raises(SchemaError):
         parse_row({k: v for k, v in ratio.items() if k != "ts_ms"})
+
+
+def test_the_top_trader_ratios_and_taker_volume_round_trip_each_as_its_own_feed() -> None:
+    """Binance's three further statistics: two ratios with the account ratio's
+    fields, and a volume pair. Each kind is its own feed and its own typed row,
+    so a reader telling them apart by type never takes one for another."""
+
+    from market_tape.schema import (
+        LANE_ROW_TYPES,
+        AccountRatioRow,
+        TakerVolumeRow,
+        TopAccountRatioRow,
+        TopPositionRatioRow,
+        account_ratio_row,
+        feed_of_row,
+        taker_volume_row,
+        top_account_ratio_row,
+        top_position_ratio_row,
+    )
+
+    common = {"venue": "binance", "symbol": "BTCUSDT", "local_receive_ts_ns": 1_800_000_180_000_000_000, "period": "5min"}
+    rows = [
+        (account_ratio_row(**common, ts_ms=1_800_000_000_000, buy_ratio=0.6, sell_ratio=0.4), AccountRatioRow),
+        (top_account_ratio_row(**common, ts_ms=1_800_000_000_000, buy_ratio=0.55, sell_ratio=0.45), TopAccountRatioRow),
+        (top_position_ratio_row(**common, ts_ms=1_800_000_000_000, buy_ratio=0.7, sell_ratio=0.3), TopPositionRatioRow),
+        (taker_volume_row(**common, ts_ms=1_800_000_000_000, buy_volume=387.33, sell_volume=420.1), TakerVolumeRow),
+    ]
+    assert [raw["kind"] for raw, _ in rows] == ["account_ratio", "top_account_ratio", "top_position_ratio", "taker_volume"]
+    for raw, typed in rows:
+        assert feed_of_row(raw) == raw["kind"]
+        row = parse_row(raw)
+        assert type(row) is typed and row.kind == raw["kind"] and isinstance(row, LANE_ROW_TYPES)
+        assert (row.venue, row.symbol, row.period, row.ts_ms) == ("binance", "BTCUSDT", "5min", 1_800_000_000_000)
+        with pytest.raises(SchemaError, match="ts_ms"):
+            parse_row({key: value for key, value in raw.items() if key != "ts_ms"})
+    taker = parse_row(rows[3][0])
+    assert isinstance(taker, TakerVolumeRow) and (taker.buy_volume, taker.sell_volume) == (387.33, 420.1)
+    assert set(rows[3][0]) == {"kind", "venue", "symbol", "local_receive_ts_ns", "period", "ts_ms", "buy_volume", "sell_volume"}
 
 
 def test_the_ticker_carries_the_venues_trailing_marks() -> None:

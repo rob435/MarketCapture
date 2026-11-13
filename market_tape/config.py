@@ -59,10 +59,13 @@ snapshots, `market_tape/venues/binance.py`), `trades`, `ticker` (last, mark, ind
 interest, best bid and ask, 24h turnover, price change, hour-ago and day-ago
 prices and the day's extremes, as the venue pushes them), `liquidations`,
 `kline:<interval>` (venue candles, e.g. `kline:1m`), `open_interest:<seconds>`
-(a REST poll, for venues that push no open interest), `funding` (the venue's
-settled funding payments, over REST once an hour) and `account_ratio` (the
-venue's long/short account ratio at five-minute resolution, over REST once an
-hour).
+(a REST poll, for venues that push no open interest), and the REST lane
+feeds, each read from the venue's history once an hour and written once per
+venue stamp: `funding` (the venue's settled funding payments),
+`account_ratio` (its long/short account ratio at five-minute resolution) and,
+on Binance only, `top_account_ratio` and `top_position_ratio` (the same split
+over the top traders' accounts and positions) and `taker_volume` (taker buy
+and sell volume per five minutes).
 
 Universes:
 
@@ -124,7 +127,19 @@ from typing import Any, Iterable, Mapping
 
 CONFIG_SCHEMA = 1
 VENUES = ("bybit", "binance")
-FEED_NAMES = ("book", "trades", "ticker", "liquidations", "kline", "open_interest", "funding", "account_ratio")
+FEED_NAMES = (
+    "book",
+    "trades",
+    "ticker",
+    "liquidations",
+    "kline",
+    "open_interest",
+    "funding",
+    "account_ratio",
+    "top_account_ratio",
+    "top_position_ratio",
+    "taker_volume",
+)
 UNIVERSE_KINDS = (
     "symbols",
     "file",
@@ -273,7 +288,7 @@ class StorageSettings:
     50, under 0.5 KB at 1.
 
     `queue_frames` and `queue_max_mb` bound the capture queue between the shards
-    and the writer, in items and in the memory they hold (`record.queue_item_bytes`);
+    and the writer, in items and in the memory they hold (`recorder.queue.queue_item_bytes`);
     a shard overruns at whichever binds first. A frame's size is the venue's: a
     quiet day's frame is ~220 B, a volatile day's `book:50` snapshot 3-5 KB.
 

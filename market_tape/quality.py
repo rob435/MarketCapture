@@ -45,9 +45,8 @@ from typing import Any, Iterable
 
 from market_tape.book import Book
 from market_tape.schema import (
-    AccountRatioRow,
+    LANE_ROW_TYPES,
     BookRow,
-    FundingRow,
     KlineRow,
     LiquidationRow,
     TickerRow,
@@ -188,10 +187,10 @@ def build_quality(rows: Iterable[Any]) -> "Any":
         elif isinstance(row, KlineRow):
             state = cell(row, feed_of_row({"kind": row.kind, "interval": row.interval}))
             state.take(row.local_receive_ts_ns, row.exchange_system_ts_ns, row.local_receive_mono_ns)
-        elif isinstance(row, (FundingRow, AccountRatioRow)):
+        elif isinstance(row, LANE_ROW_TYPES):
             # Fetched over REST after the fact: the stamp is the venue's
             # bucket, not a send time, so it says nothing about the clock.
-            cell(row, "funding" if isinstance(row, FundingRow) else "account_ratio").take(row.local_receive_ts_ns, 0)
+            cell(row, feed_of_row({"kind": row.kind})).take(row.local_receive_ts_ns, 0)
 
     import polars as pl
 

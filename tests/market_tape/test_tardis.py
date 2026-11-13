@@ -385,3 +385,113 @@ def test_top_trades_ticker_and_liquidations(tmp_path: Path) -> None:
     # A liquidated long is closed by a sell order, which is the side Tardis states.
     assert (liquidation["side"], liquidation["price"], liquidation["amount"]) == ("sell", "99.9", "3")
     assert liquidation["timestamp"] == str(day_us + 52_000)
+
+
+def test_a_binance_symbol_day_exports_its_ticker_open_interest_liquidations_and_top_of_book(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rows as the Binance adapter makes them, through `export_symbol_day`:
+    `@markPrice@1s` and `@ticker` frames and the open-interest poll fold into
+    one `derivative_ticker` state, a `!forceOrder@arr` order's side is the
+    side Tardis states, and `@bookTicker` is `book_ticker`."""
+
+    import urllib.request
+
+    from market_tape.venues.binance import BinanceAdapter
+
+    adapter = BinanceAdapter(rest_url="http://venue")
+    day_ms = DAY_NS // MS
+
+    def frame(at_ms: int, stream: str, data: dict[str, Any]) -> list[dict[str, Any]]:
+        return adapter.normalize(json.dumps({"stream": stream, "data": data}), DAY_NS + at_ms * MS, 1)
+
+    class Answer:
+        def __init__(self, payload: Any) -> None:
+            self.payload = payload
+
+        def read(self) -> bytes:
+            return json.dumps(self.payload).encode()
+
+        def __enter__(self) -> Answer:
+            return self
+
+        def __exit__(self, *exc: Any) -> bool:
+            return False
+
+    rows = frame(
+        10,
+        "btcusdt@bookTicker",
+        {"e": "bookTicker", "u": 400900217, "s": "BTCUSDT", "b": "83680.00", "B": "7.816", "a": "83680.10", "A": "1.566", "T": day_ms + 8, "E": day_ms + 9},
+    )
+    rows += frame(
+        20,
+        "btcusdt@markPrice@1s",
+        {"e": "markPriceUpdate", "E": day_ms + 18, "s": "BTCUSDT", "p": "83681.20000000", "i": "83675.06511628", "P": "83690.1", "r": "0.00003805", "T": day_ms + 8 * 3_600_000},
+    )
+    rows += frame(
+        30,
+        "btcusdt@ticker",
+        {"e": "24hrTicker", "E": day_ms + 29, "s": "BTCUSDT", "c": "83680.10", "q": "9000000.5", "v": "107.6", "P": "-1.25"},
+    )
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda request, timeout=None: Answer({"symbol": "BTCUSDT", "openInterest": "10659.509", "time": day_ms + 35})
+    )
+    poll = adapter.open_interest_row("BTCUSDT")
+    rows.append({**poll, "local_receive_ts_ns": DAY_NS + 40 * MS})
+    rows += frame(
+        50,
+        "!forceOrder@arr",
+        {"e": "forceOrder", "E": day_ms + 49, "o": {"s": "BTCUSDT", "S": "SELL", "o": "LIMIT", "f": "IOC", "q": "0.014", "p": "83500.5", "ap": "83510.0", "X": "FILLED", "l": "0.014", "z": "0.014", "T": day_ms + 48}},
+    )
+    rows += frame(
+        60,
+        "!forceOrder@arr",
+        {"e": "forceOrder", "E": day_ms + 59, "o": {"s": "BTCUSDT", "S": "BUY", "q": "1", "p": "83900", "T": day_ms + 58}},
+    )
+    rows += frame(
+        70,
+        "btcusdt@markPrice@1s",
+        {"e": "markPriceUpdate", "E": day_ms + 69, "s": "BTCUSDT", "p": "83681.20000000", "i": "83675.06511628", "r": "0.00003805", "T": day_ms + 8 * 3_600_000},
+    )
+    assert [row["kind"] for row in rows] == ["orderbook_snapshot", "ticker", "ticker", "ticker", "liquidation", "liquidation", "ticker"]
+
+    root = _tape(tmp_path / "binance-usdm", "BTCUSDT", rows)
+    entry = export_symbol_day(
+        open_source(str(root)), DAY, "BTCUSDT", tmp_path / "out", types=["derivative_ticker", "liquidations", "book_ticker"]
+    )
+    out = tmp_path / "out" / "binance-futures"
+    day_us = DAY_NS // 1_000
+    assert entry["exchange"] == "binance-futures" and entry["restamped"] == 0
+
+    tickers = _read(out / "derivative_ticker" / DAY / "BTCUSDT.csv.gz")
+    # The last mark frame changed nothing the file states, so it writes no row.
+    assert [(row["timestamp"], row["local_timestamp"]) for row in tickers] == [
+        (str(day_us + 18_000), str(day_us + 20_000)),
+        (str(day_us + 29_000), str(day_us + 30_000)),
+        (str(day_us + 35_000), str(day_us + 40_000)),
+    ]
+    assert tickers[-1] == {
+        "exchange": "binance-futures",
+        "symbol": "BTCUSDT",
+        "timestamp": str(day_us + 35_000),
+        "local_timestamp": str(day_us + 40_000),
+        "funding_timestamp": str((day_ms + 8 * 3_600_000) * 1_000),
+        "funding_rate": "0.00003805",
+        "predicted_funding_rate": "",
+        "open_interest": "10659.509",
+        "last_price": "83680.1",
+        "index_price": "83675.06511628",
+        "mark_price": "83681.2",
+    }
+    assert tickers[0]["open_interest"] == "" and tickers[0]["last_price"] == ""
+
+    liquidations = _read(out / "liquidations" / DAY / "BTCUSDT.csv.gz")
+    # A SELL liquidation order closes a long: Tardis states the order's side, as Binance does.
+    assert [(row["side"], row["price"], row["amount"], row["timestamp"]) for row in liquidations] == [
+        ("sell", "83500.5", "0.014", str(day_us + 48_000)),
+        ("buy", "83900", "1", str(day_us + 58_000)),
+    ]
+
+    (top,) = _read(out / "book_ticker" / DAY / "BTCUSDT.csv.gz")
+    assert (top["timestamp"], top["local_timestamp"]) == (str(day_us + 9_000), str(day_us + 10_000))
+    assert (top["bid_price"], top["bid_amount"], top["ask_price"], top["ask_amount"]) == ("83680.00", "7.816", "83680.10", "1.566")

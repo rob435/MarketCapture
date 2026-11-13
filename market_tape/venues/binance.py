@@ -1,4 +1,9 @@
-"""Binance USD-M perpetual futures: stream names, message shapes, REST tables and the open-interest lane.
+"""Binance USD-M perpetual futures: the adapter, its stream names and message shapes, and its lanes.
+
+Everything asked of the REST API (the tables, the open-interest poll, the
+`book:1000` snapshot lane and the hourly lane, and the weight and 429
+handling all of them share) is `market_tape/venues/binance_rest.py`; its
+public names are importable from here too.
 
 The venue routes streams by URL path, and a connection receives only its own
 path's streams, silently dropping the rest (measured 2026-09-25):
@@ -21,7 +26,7 @@ symbol listed mid-run joins a live connection.
 Venue limits: 1024 streams a connection (`MAX_STREAMS`, which
 `topics_per_connection` may not exceed); 10 incoming messages a second, pings
 and pongs included (the recorder spaces its frames
-`record.LIVE_MESSAGE_SPACING_SECONDS` apart); a ping every 3 minutes, which the
+`recorder.shard.LIVE_MESSAGE_SPACING_SECONDS` apart); a ping every 3 minutes, which the
 reader answers; a close at every connection's 24-hour mark, after which the
 shard reconnects.
 
@@ -30,6 +35,17 @@ shard reconnects.
 so nothing here needs a subscription to anchor it: `anchored_topics` is empty
 and the hourly re-anchor sends nothing. Open interest is a REST poll: no
 stream pushes it.
+
+The venue's histories no stream carries ride one hourly REST lane, the walk
+Bybit's lane runs (`market_tape/venues/lanes.py`): `funding` (settled
+payments, `/fapi/v1/fundingRate`), `account_ratio` (all accounts' long/short
+split), `top_account_ratio` and `top_position_ratio` (the top traders'
+accounts and positions) and `taker_volume` (taker buy and sell volume), the
+last four five-minute statistics from `/futures/data/*`: the channels
+tardis.dev records for binance-futures beyond the streams. Its stamps live on
+the adapter (`lane_state`), so a lane restarted on a universe change writes
+nothing twice; its pacing, and the arithmetic that keeps it and the other
+lanes under the venue's per-IP limits, are in `binance_rest.py`.
 
 `book:1000` is the full incremental book, recorded as tardis.dev records it:
 the diff stream `<pair>@depth@100ms` (`DIFF_DEPTH_SPEED`, on `/stream`) plus
@@ -53,11 +69,13 @@ the open-interest poll and the table reads) is what paces it:
 and the cells read `book_gap` until then.
 
 Measured versus assumed: every other stream above was measured against the
-venue; the diff book was not. This sandbox cannot reach Binance (HTTP 451),
-so the stream name, the REST shape, the `X-MBX-USED-WEIGHT-1M` header and the
-`U`/`u`/`pu` rules follow Binance's published USD-M documentation ("How to
-manage a local order book correctly") and are verified only against local fake
-servers in the tests.
+venue; the diff book and the hourly lane were not. This sandbox cannot reach
+Binance (HTTP 451), so the diff stream's name, every REST path and answer
+shape the two lanes read, the `X-MBX-USED-WEIGHT-1M` header, `Retry-After`,
+the per-endpoint limits and the `U`/`u`/`pu` rules follow Binance's published
+USD-M documentation ("How to manage a local order book correctly", "Market
+Data Endpoints") and are verified only against injected fetches and local
+fake servers in the tests.
 """
 
 from __future__ import annotations
@@ -67,15 +85,64 @@ import json
 import logging
 import threading
 import time
-import urllib.error
-import urllib.request
-from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping
 
 from market_tape.config import ConfigError, Feed
 from market_tape.jsonfast import loads as fast_loads
 from market_tape.schema import TICKER_INT_FIELDS, kline_row, liquidation_row, ticker_row, trade_row, typed_book_row
 from market_tape.venues import Emit
+from market_tape.venues.binance_rest import (
+    DEPTH_SNAPSHOT_WEIGHT,
+    DIFF_BOOK_LEVELS,
+    FUNDING_HISTORY_LIMIT,
+    FUNDING_HISTORY_MAX_LIMIT,
+    FUNDING_PAUSE_SECONDS,
+    FUNDING_STEP_MS,
+    HOUR_NS,
+    LANE_FEEDS,
+    LANE_INTERVAL_SECONDS,
+    LANE_OFFSET_SECONDS,
+    SNAPSHOT_RETRY_MAX_SECONDS,
+    SNAPSHOT_RETRY_MIN_SECONDS,
+    SNAPSHOT_WEIGHT_PER_MINUTE,
+    STATISTICS_LIMIT,
+    STATISTICS_MAX_LIMIT,
+    STATISTICS_PATHS,
+    STATISTICS_PAUSE_SECONDS,
+    STATISTICS_STEP_MS,
+    VENUE_WEIGHT_PER_MINUTE,
+    WEIGHT_THROTTLE_FRACTION,
+    DepthSnapshotLane,
+    _float,
+    _ns,
+    fetch_depth,
+    fetch_funding_history,
+    fetch_instruments,
+    fetch_open_interest,
+    fetch_statistics,
+    fetch_tickers,
+    funding_rows,
+    statistics_rows,
+)
+from market_tape.venues.lanes import HourlyLane, LaneFeed, LaneState, RateLimited, RestBudget
+
+# The REST side lives in `binance_rest`; its public names are this module's too.
+__all__ = [
+    "BOOK_LEVELS",
+    "DEPTH_SNAPSHOT_WEIGHT",
+    "DIFF_BOOK_LEVELS",
+    "HOUR_NS",
+    "LANE_FEEDS",
+    "SNAPSHOT_RETRY_MAX_SECONDS",
+    "SNAPSHOT_RETRY_MIN_SECONDS",
+    "SNAPSHOT_WEIGHT_PER_MINUTE",
+    "BinanceAdapter",
+    "DepthSnapshotLane",
+    "RateLimited",
+    "fetch_depth",
+    "fetch_funding_history",
+    "fetch_statistics",
+]
 
 PUBLIC_USDM_WS = "wss://fstream.binance.com"
 PUBLIC_REST = "https://fapi.binance.com"
@@ -85,31 +152,9 @@ GROUP_PATHS = {"public": "/stream", "market": "/market/stream"}
 DIFF_DEPTH_SPEED = "100ms"
 #: A diff stream's name after the pair.
 DIFF_SUFFIX = f"depth@{DIFF_DEPTH_SPEED}"
-#: The diff book's depth on the tape: the level count of the REST snapshot it rides on.
-DIFF_BOOK_LEVELS = 1000
 #: `book:1` is `bookTicker`; 5, 10 and 20 are the partial-book streams; 1000
 #: the diff stream with its REST snapshots.
 BOOK_LEVELS = (1, 5, 10, 20, DIFF_BOOK_LEVELS)
-#: The venue's request weight of one 1000-level `/fapi/v1/depth`, and its
-#: per-IP weight limit a minute, shared by every REST call from the host.
-DEPTH_SNAPSHOT_WEIGHT = 20
-VENUE_WEIGHT_PER_MINUTE = 2_400
-#: What the snapshot lane spends of it: 50 snapshots a minute, leaving the open-interest poll and the table reads the rest.
-SNAPSHOT_WEIGHT_PER_MINUTE = 1_000
-#: Past this share of the venue's minute (its `X-MBX-USED-WEIGHT-1M` header),
-#: the lane waits out the minute: something else on the host is spending it.
-WEIGHT_THROTTLE_FRACTION = 0.75
-#: A 429 or 418 without `Retry-After`: pause the whole lane this long.
-RATE_LIMIT_DEFAULT_SECONDS = 60.0
-#: One symbol's failed snapshot is retried after this, doubling to the maximum.
-SNAPSHOT_RETRY_MIN_SECONDS = 2.0
-SNAPSHOT_RETRY_MAX_SECONDS = 300.0
-#: A snapshot older than its chain's first diff is fetched again after this.
-STALE_SNAPSHOT_RETRY_SECONDS = 1.0
-SNAPSHOT_TIMEOUT_SECONDS = 10.0
-#: The lane's longest wait between looks at `stop` and its requests.
-LANE_POLL_SECONDS = 0.25
-HOUR_NS = 3_600 * 1_000_000_000
 LIQUIDATION_STREAM = "!forceOrder@arr"
 KLINE_INTERVALS = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M")
 #: The streams the `/stream` path carries, by suffix; every other stream rides `/market`.
@@ -128,344 +173,6 @@ MARK_PRICE_FIELDS = {"p": "mark_price", "i": "index_price", "r": "funding_rate",
 DAY_TICKER_FIELDS = {"c": "last_price", "q": "turnover_24h", "v": "volume_24h", "P": "price_change_24h_pct"}
 #: Binance states the 24h change in percent; the contract stores a fraction.
 PERCENT_FIELDS = frozenset({"price_change_24h_pct"})
-PREMIUM_TABLE_FIELDS = ("markPrice", "indexPrice", "lastFundingRate", "nextFundingTime")
-DAY_TABLE_FIELDS = ("lastPrice", "quoteVolume", "volume")
-BOOK_TABLE_FIELDS = ("bidPrice", "bidQty", "askPrice", "askQty")
-
-
-def fetch_public_json(url: str, timeout: float = 20.0) -> Any:
-    request = urllib.request.Request(url, headers={"User-Agent": "market-tape"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        payload = json.loads(response.read())
-    if isinstance(payload, Mapping) and "code" in payload and "msg" in payload:
-        raise RuntimeError(f"venue refused {url}: {str(payload)[:200]}")
-    return payload
-
-
-def _table(payload: Any) -> list[dict[str, Any]]:
-    return [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
-
-
-def fetch_instruments(rest_base: str) -> list[dict[str, Any]]:
-    payload = fetch_public_json(f"{rest_base}/fapi/v1/exchangeInfo")
-    return _table(payload.get("symbols")) if isinstance(payload, Mapping) else []
-
-
-def fetch_tickers(rest_base: str) -> list[dict[str, Any]]:
-    """One row per symbol, carrying the fields three whole-market tables hold."""
-
-    merged: dict[str, dict[str, Any]] = {}
-    for path, fields in (
-        ("/fapi/v1/premiumIndex", PREMIUM_TABLE_FIELDS),
-        ("/fapi/v1/ticker/24hr", DAY_TABLE_FIELDS),
-        ("/fapi/v1/ticker/bookTicker", BOOK_TABLE_FIELDS),
-    ):
-        for row in _table(fetch_public_json(f"{rest_base}{path}")):
-            symbol = str(row.get("symbol") or "").upper()
-            if not symbol:
-                continue
-            target = merged.setdefault(symbol, {"symbol": symbol})
-            for name in fields:
-                if row.get(name) is not None:
-                    target[name] = row[name]
-    return [merged[symbol] for symbol in sorted(merged)]
-
-
-def fetch_open_interest(rest_base: str, symbol: str) -> dict[str, Any]:
-    payload = fetch_public_json(f"{rest_base}/fapi/v1/openInterest?symbol={symbol}")
-    if not isinstance(payload, Mapping):
-        raise RuntimeError(f"open interest for {symbol} is not a table: {str(payload)[:200]}")
-    return dict(payload)
-
-
-class RateLimited(RuntimeError):
-    """The venue answered 429 (over the weight limit) or 418 (banned for
-    having ignored a 429): every request from the IP waits `retry_after`."""
-
-    def __init__(self, status: int, retry_after: float) -> None:
-        super().__init__(f"HTTP {status}, retry after {retry_after:g}s")
-        self.status = status
-        self.retry_after = retry_after
-
-
-def _header_number(headers: Any, name: str) -> float | None:
-    raw = headers.get(name) if headers is not None else None
-    try:
-        return float(raw) if raw not in (None, "") else None
-    except (TypeError, ValueError):
-        return None
-
-
-def fetch_depth(rest_base: str, symbol: str, timeout: float = SNAPSHOT_TIMEOUT_SECONDS) -> tuple[dict[str, Any], int | None]:
-    """One symbol's 1000-level REST book, and the IP's weight used this minute
-    as the venue's `X-MBX-USED-WEIGHT-1M` header states it (None when absent).
-
-    Raises `RateLimited` on 429 and 418, and whatever else the request met."""
-
-    url = f"{rest_base}/fapi/v1/depth?symbol={symbol}&limit={DIFF_BOOK_LEVELS}"
-    request = urllib.request.Request(url, headers={"User-Agent": "market-tape"})
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            used = _header_number(getattr(response, "headers", None), "X-MBX-USED-WEIGHT-1M")
-            payload = json.loads(response.read())
-    except urllib.error.HTTPError as exc:
-        if exc.code in (418, 429):
-            wait = _header_number(exc.headers, "Retry-After")
-            raise RateLimited(exc.code, wait if wait is not None and wait > 0 else RATE_LIMIT_DEFAULT_SECONDS) from exc
-        raise
-    if not isinstance(payload, Mapping) or "lastUpdateId" not in payload:
-        raise RuntimeError(f"venue refused {url}: {str(payload)[:200]}")
-    return dict(payload), None if used is None else int(used)
-
-
-@dataclass
-class DepthSnapshotLane:
-    """The REST snapshots the `book:1000` diff stream rides on, one thread's work.
-
-    The state lives here, on the adapter, and not in the thread: the recorder
-    stops and restarts its lanes whenever the universe changes, and a gap
-    asked for, a symbol in backoff or a minute's spent weight must outlive
-    that. `run_lock` keeps one thread at a time in `run`, so a restart whose
-    old thread is still inside a fetch never has two walking the state.
-
-    Two kinds of work, in this order:
-
-    1. A symbol whose chain gapped, asked for by `request` from the writer
-       thread. The request is taken off `wanted` when its fetch starts, so a
-       gap that arrives while the fetch is in flight puts it back and costs
-       another fetch: that snapshot may land on the tape ahead of the new
-       gap's diff and could not re-base it.
-    2. Once per UTC hour (`hourly`, the config's
-       `connection.reanchor_each_hour`), every diff symbol not yet
-       snapshotted in that hour, in sorted order from the hour boundary, so
-       one hour's tar replays without the hours before it.
-
-    Pacing: one fetch per `60 * DEPTH_SNAPSHOT_WEIGHT / weight_per_minute`
-    seconds, every attempt counted because the venue counts it; past
-    `WEIGHT_THROTTLE_FRACTION` of the venue's minute (what its header says the
-    whole IP has spent) the next fetch waits for the next minute. A 429 or
-    418 pauses the whole lane for `Retry-After`. Any other failure retries
-    that symbol with backoff and moves on to the others. A snapshot older than
-    its chain's first diff could never be bracketed and is not emitted; one
-    the writer's queue had no room for is asked for again. Nothing here
-    raises out of `run`, and `run` returns within `LANE_POLL_SECONDS` of
-    `stop`, or after the fetch in hand (`SNAPSHOT_TIMEOUT_SECONDS`).
-    """
-
-    rest_url: str
-    venue: str = "binance"
-    fetch: Callable[[str, str], tuple[dict[str, Any], int | None]] = fetch_depth
-    wall_ns: Callable[[], int] = time.time_ns
-    monotonic: Callable[[], float] = time.monotonic
-    weight_per_minute: float = SNAPSHOT_WEIGHT_PER_MINUTE
-    hourly: bool = True
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    run_lock: threading.Lock = field(default_factory=threading.Lock)
-    wake: threading.Event = field(default_factory=threading.Event)
-    #: Gapped symbols waiting for a snapshot, oldest request first (under `lock`).
-    wanted: dict[str, None] = field(default_factory=dict)
-    #: Each symbol's current chain's first `U`, written with its request.
-    chain_first: dict[str, int] = field(default_factory=dict)
-    #: The UTC hour (`ns // HOUR_NS`) of each symbol's last emitted snapshot.
-    snapshot_hour: dict[str, int] = field(default_factory=dict)
-    retry_at: dict[str, float] = field(default_factory=dict)
-    failures_in_row: dict[str, int] = field(default_factory=dict)
-    symbols: tuple[str, ...] = ()
-    members: frozenset[str] = frozenset()
-    next_fetch_at: float = 0.0
-    paused_until: float = 0.0
-    throttled_until_ns: int = 0
-    used_weight: int | None = None
-    snapshots: int = 0
-    failures: int = 0
-    stale: int = 0
-    dropped: int = 0
-    rate_limited: int = 0
-
-    # ------------------------------------------------------------ requests
-
-    def request(self, symbol: str, first_update_id: int) -> None:
-        """A chain starting at `first_update_id` needs a snapshot: the writer
-        thread's call, on a gap only, so a clean diff never takes the lock."""
-
-        with self.lock:
-            self.chain_first[symbol] = first_update_id
-            self.wanted[symbol] = None
-        self.wake.set()
-
-    def use(self, symbols: Iterable[str]) -> None:
-        """The diff symbols this lane serves now; the requests of any other are dropped.
-
-        Only here, as a lane starts: the recorder subscribes a new symbol before
-        it restarts the lane, so the outgoing lane meets that symbol's first
-        request and must leave it for its successor."""
-
-        self.symbols = tuple(sorted(set(symbols)))
-        self.members = frozenset(self.symbols)
-        with self.lock:
-            for symbol in [symbol for symbol in self.wanted if symbol not in self.members]:
-                del self.wanted[symbol]
-
-    # ----------------------------------------------------------------- run
-
-    def run(self, symbols: Iterable[str], emit: Emit, stop: threading.Event) -> None:
-        while not self.run_lock.acquire(timeout=LANE_POLL_SECONDS):
-            if stop.is_set():
-                return
-        try:
-            self.use(symbols)
-            while not stop.is_set():
-                try:
-                    delay = self.step(emit)
-                except Exception:  # the lane outlives anything one step meets
-                    logging.exception("binance depth snapshot lane step failed")
-                    delay = 1.0
-                self.wake.wait(max(0.0, min(delay, LANE_POLL_SECONDS)))
-                self.wake.clear()
-        finally:
-            self.run_lock.release()
-
-    @property
-    def spacing_seconds(self) -> float:
-        return 60.0 * DEPTH_SNAPSHOT_WEIGHT / self.weight_per_minute if self.weight_per_minute > 0 else 60.0
-
-    def step(self, emit: Emit) -> float:
-        """Take at most one snapshot; return the seconds until the next could be due."""
-
-        now = self.monotonic()
-        if now < self.paused_until:
-            return self.paused_until - now
-        if now < self.next_fetch_at:
-            return self.next_fetch_at - now
-        symbol, gapped = self._pick(now)
-        if symbol is None:
-            return 1.0
-        self.next_fetch_at = now + self.spacing_seconds
-        try:
-            payload, used = self.fetch(self.rest_url, symbol)
-            received_ns = self.wall_ns()
-            row = self.snapshot_row(symbol, payload, received_ns)
-        except RateLimited as exc:
-            self.rate_limited += 1
-            self.paused_until = self.monotonic() + exc.retry_after
-            self.throttled_until_ns = self.wall_ns() + int(exc.retry_after * 1e9)
-            self._again(symbol, gapped)
-            logging.warning("binance depth snapshots paused %.0fs: %s", exc.retry_after, exc)
-            return exc.retry_after
-        except Exception as exc:  # one symbol's failure is retried; the others go on
-            self.failures += 1
-            count = self.failures_in_row[symbol] = self.failures_in_row.get(symbol, 0) + 1
-            delay = min(SNAPSHOT_RETRY_MIN_SECONDS * 2.0 ** (count - 1), SNAPSHOT_RETRY_MAX_SECONDS)
-            self.retry_at[symbol] = self.monotonic() + delay
-            self._again(symbol, gapped)
-            if count == 1:
-                logging.warning("binance depth snapshot for %s failed, retrying with backoff: %s", symbol, exc)
-            return 0.0
-        self._note_weight(used)
-        self.failures_in_row.pop(symbol, None)
-        self.retry_at.pop(symbol, None)
-        first = self.chain_first.get(symbol)
-        if first is not None and row["update_id"] < first:
-            # The REST answer predates the chain the tape holds: no diff on the
-            # tape can bracket it, so it would only re-base nothing.
-            self.stale += 1
-            self.retry_at[symbol] = self.monotonic() + STALE_SNAPSHOT_RETRY_SECONDS
-            self._again(symbol, gapped)
-            return 0.0
-        if emit(row) is False:
-            self.dropped += 1
-            self._again(symbol, True)
-            return 0.0
-        self.snapshots += 1
-        self.snapshot_hour[symbol] = received_ns // HOUR_NS
-        return 0.0
-
-    def _pick(self, now: float) -> tuple[str | None, bool]:
-        with self.lock:
-            for symbol in list(self.wanted):
-                if symbol not in self.members or self.retry_at.get(symbol, 0.0) > now:
-                    continue
-                del self.wanted[symbol]
-                return symbol, True
-        if not self.hourly:
-            return None, False
-        hour = self.wall_ns() // HOUR_NS
-        for symbol in self.symbols:
-            # A symbol no diff has reached yet is asked for by its first diff.
-            if self.snapshot_hour.get(symbol) == hour or symbol not in self.chain_first:
-                continue
-            if self.retry_at.get(symbol, 0.0) > now:
-                continue
-            return symbol, False
-        return None, False
-
-    def _again(self, symbol: str, gapped: bool) -> None:
-        # An hourly symbol needs nothing: the hour's walk finds it again.
-        if gapped:
-            with self.lock:
-                self.wanted.setdefault(symbol, None)
-
-    def _note_weight(self, used: int | None) -> None:
-        if used is None:
-            return
-        self.used_weight = used
-        if used > WEIGHT_THROTTLE_FRACTION * VENUE_WEIGHT_PER_MINUTE:
-            wall_ns = self.wall_ns()
-            wait = 60.0 - (wall_ns / 1e9) % 60.0
-            self.next_fetch_at = max(self.next_fetch_at, self.monotonic() + wait)
-            self.throttled_until_ns = max(self.throttled_until_ns, wall_ns + int(wait * 1e9))
-
-    def snapshot_row(self, symbol: str, payload: Mapping[str, Any], received_ns: int) -> dict[str, Any]:
-        return typed_book_row(
-            self.venue,
-            symbol,
-            True,  # snapshot
-            DIFF_BOOK_LEVELS,
-            received_ns,
-            0,  # local_receive_mono_ns: no socket read carried it
-            _ns(payload.get("E")),
-            _ns(payload.get("T")),
-            list(payload.get("bids") or []),
-            list(payload.get("asks") or []),
-            int(payload["lastUpdateId"]),
-            0,  # previous_update_id
-            0,  # first_update_id
-            0,  # cross_sequence
-            0,  # previous_cross_sequence
-            False,  # restart_snapshot
-            False,  # sequence_gap
-        )
-
-    def status(self) -> dict[str, Any]:
-        with self.lock:
-            pending = len(self.wanted)
-        return {
-            "symbols": len(self.symbols),
-            "snapshots": self.snapshots,
-            "failures": self.failures,
-            "stale": self.stale,
-            "dropped": self.dropped,
-            "rate_limited": self.rate_limited,
-            "pending": pending,
-            "used_weight_1m": self.used_weight,
-            "throttled_until_ns": self.throttled_until_ns if self.throttled_until_ns > self.wall_ns() else 0,
-        }
-
-
-def _ns(value: Any) -> int:
-    try:
-        return int(value or 0) * 1_000_000
-    except (TypeError, ValueError):
-        return 0
-
-
-def _float(value: Any) -> float | None:
-    if value is None or value == "":
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _level(price: Any, size: Any) -> list[list[str]]:
@@ -503,7 +210,14 @@ class BinanceAdapter:
         #: The writer thread's alone: each diff symbol's last `u`, absent until
         #: its first diff and again after `chain_reset`.
         self.diff_last_u: dict[str, int] = {}
-        self.depth_snapshots = DepthSnapshotLane(rest_url=self.rest_url, venue=self.name)
+        #: The IP's standing with the venue, shared by every lane: a 429 on one pauses all.
+        self.rest_budget = RestBudget(VENUE_WEIGHT_PER_MINUTE, WEIGHT_THROTTLE_FRACTION)
+        self.depth_snapshots = DepthSnapshotLane(rest_url=self.rest_url, venue=self.name, budget=self.rest_budget)
+        #: The hourly lane's stamps and health: the adapter's, so they outlive a lane restart.
+        self.lane_state = LaneState()
+        #: The hourly lane's two fetches, looked up at each request (a test swaps them).
+        self.fetch_funding: Callable[[str, str, int], tuple[list[dict[str, Any]], int | None]] = fetch_funding_history
+        self.fetch_statistics: Callable[[str, str, str, int], tuple[list[dict[str, Any]], int | None]] = fetch_statistics
 
     def configure(self, config: Any) -> None:
         """The recorder's config, once, before any lane starts: the hourly
@@ -522,8 +236,6 @@ class BinanceAdapter:
                 )
             if feed.name == "kline" and feed.arg not in KLINE_INTERVALS:
                 raise ConfigError(f"Binance kline intervals are {list(KLINE_INTERVALS)}, not {feed.text}")
-            if feed.name in ("funding", "account_ratio"):
-                raise ConfigError(f"the Binance recorder has no {feed.name} lane; the ticker carries the funding rate")
 
     def topics(self, symbol: str, feeds: Iterable[Feed]) -> list[str]:
         lower = symbol.lower()
@@ -579,7 +291,11 @@ class BinanceAdapter:
                 self.diff_last_u.pop(pair.upper(), None)
 
     def lane_status(self) -> dict[str, Any]:
-        return {"depth_snapshots": self.depth_snapshots.status()}
+        return {
+            "depth_snapshots": self.depth_snapshots.status(),
+            "rest": self.lane_state.status(),
+            "rest_budget": self.rest_budget.status(time.time_ns()),
+        }
 
     def connection_url(self, topics: list[str]) -> str:
         groups = {self.connection_group(topic) for topic in topics} or {"public"}
@@ -625,6 +341,11 @@ class BinanceAdapter:
             )
             thread.start()
             threads.append(thread)
+        lane = self.rest_lane(feeds_by_symbol, emit, stop)
+        if lane is not None:
+            thread = lane.thread()
+            thread.start()
+            threads.append(thread)
         for seconds, symbols in sorted(by_interval.items()):
             thread = threading.Thread(
                 target=self._open_interest_lane,
@@ -636,14 +357,75 @@ class BinanceAdapter:
             threads.append(thread)
         return threads
 
+    def rest_lane(
+        self, feeds_by_symbol: Mapping[str, tuple[Feed, ...]], emit: Emit, stop: threading.Event
+    ) -> HourlyLane | None:
+        """The hourly lane for the symbols that ask for a lane feed, not started;
+        None when none does. Its stamps live in `lane_state` and its pauses in
+        `rest_budget`, both the adapter's."""
+
+        feeds = []
+        for name in LANE_FEEDS:
+            symbols = tuple(sorted(symbol for symbol, wanted in feeds_by_symbol.items() if Feed(name) in wanted))
+            if symbols:
+                feeds.append(self._lane_feed(name, symbols))
+        if not feeds:
+            return None
+        return HourlyLane(
+            venue=self.name,
+            feeds=tuple(feeds),
+            emit=emit,
+            stop=stop,
+            state=self.lane_state,
+            budget=self.rest_budget,
+            interval_seconds=LANE_INTERVAL_SECONDS,
+            offset_seconds=LANE_OFFSET_SECONDS,
+        )
+
+    def _lane_feed(self, name: str, symbols: tuple[str, ...]) -> LaneFeed:
+        if name == "funding":
+            return LaneFeed(
+                name=name,
+                symbols=symbols,
+                fetch=lambda symbol, limit: self.fetch_funding(self.rest_url, symbol, limit),
+                rows=lambda symbol, listed, received, after: funding_rows(self.name, symbol, listed, received, after_ms=after),
+                stamp="funding_time_ms",
+                limit=FUNDING_HISTORY_LIMIT,
+                step_ms=FUNDING_STEP_MS,
+                max_limit=FUNDING_HISTORY_MAX_LIMIT,
+                pause=FUNDING_PAUSE_SECONDS,
+                newest_only_first=True,
+            )
+        path = STATISTICS_PATHS[name]
+        return LaneFeed(
+            name=name,
+            symbols=symbols,
+            fetch=lambda symbol, limit: self.fetch_statistics(self.rest_url, path, symbol, limit),
+            rows=lambda symbol, listed, received, after: statistics_rows(
+                name, self.name, symbol, listed, received, after_ms=after
+            ),
+            stamp="ts_ms",
+            limit=STATISTICS_LIMIT,
+            step_ms=STATISTICS_STEP_MS,
+            max_limit=STATISTICS_MAX_LIMIT,
+            pause=STATISTICS_PAUSE_SECONDS,
+        )
+
     def _open_interest_lane(self, symbols: list[str], seconds: float, emit: Emit, stop: threading.Event) -> None:
         while not stop.is_set():
             started = time.monotonic()
             for symbol in symbols:
                 if stop.is_set():
                     return
+                # A 429 on any lane, or a heavy minute, holds the polls too.
+                paused = self.rest_budget.wait_seconds(time.monotonic())
+                if paused > 0 and stop.wait(paused):
+                    return
                 try:
                     emit(self.open_interest_row(symbol))
+                except RateLimited as exc:
+                    self.rest_budget.note_rate_limited(exc.retry_after, time.monotonic(), time.time_ns())
+                    logging.warning("binance open interest polls paused %.0fs: %s", exc.retry_after, exc)
                 except Exception as exc:  # noqa: BLE001 - one symbol's failed poll must not end the lane
                     logging.warning("open interest poll for %s failed: %s", symbol, exc)
                 if stop.wait(OPEN_INTEREST_PAUSE_SECONDS):
@@ -651,8 +433,9 @@ class BinanceAdapter:
             stop.wait(max(0.0, seconds - (time.monotonic() - started)))
 
     def open_interest_row(self, symbol: str) -> dict[str, Any]:
-        payload = fetch_open_interest(self.rest_url, symbol)
+        payload, used = fetch_open_interest(self.rest_url, symbol)
         received_ns = time.time_ns()
+        self.rest_budget.note_weight(used, time.monotonic(), received_ns)
         count = _float(payload.get("openInterest")) or 0.0
         values: dict[str, float | int] = {"open_interest": count}
         mark = self.marks.get(symbol)

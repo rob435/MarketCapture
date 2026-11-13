@@ -1,0 +1,78 @@
+# Everything Binance USD-M publishes, for every listed USDT perpetual: the
+# configuration for a machine with unbounded bandwidth and disk, the Binance
+# twin of bybit-full-universe.toml and the channels tardis.dev records for
+# binance-futures. Binance lists about 550 USDT perpetuals; size the storage
+# figures to the disk you have.
+#
+# Every feed, in two tiers:
+#
+# - `everything`: every listed name's top of book (`book:1`, `bookTicker`), its
+#   20-level book (`book:20`; `book:5` and `book:10` are its first levels, so
+#   they are not asked for again), prints, mark-price and 24h tickers,
+#   liquidations, one-minute candles, a one-minute open-interest poll, and the
+#   five hourly REST lanes: settled `funding`, `account_ratio`,
+#   `top_account_ratio`, `top_position_ratio` and `taker_volume`
+#   (market_tape/venues/binance_rest.py; ~550 symbols x 5 histories walk in
+#   ~28 minutes an hour, at most 60 % of each endpoint's per-IP limit).
+# - `core`: the full 1000-level book (`book:1000`) for the most-traded names
+#   only. Each 1000-level REST snapshot costs 20 of the IP's 2,400 request
+#   weight a minute and the snapshot lane spends at most 1,000 of it, beside
+#   the open-interest poll's ~550: 50 snapshots a minute. A whole universe of
+#   diff books would take ~11 minutes to base after every connect and every
+#   24-hour reconnect, its cells reading `book_gap` until then, and its hourly
+#   re-anchor alone would keep the lane busy 11 minutes in every hour; 30
+#   names are based within a minute. Snapshot rows are ~45-55 KB of JSON, so
+#   `segment_buffer_kb` stays at the default 64.
+#
+# Where `fapi.binance.com` answers 451 the streams still flow but nothing
+# REST does: `listed` holds nothing, and the snapshots, the polls and the
+# lanes fail (`status.json` `lanes_status`).
+#
+#   python -m market_tape check --config market_tape/examples/binance-full-universe.toml
+schema = 1
+
+[venue]
+name = "binance"
+market = "usdm"
+
+[storage]
+root = "/data/market-tape/binance-usdm"
+segment_max_mb = 256
+segment_buffer_kb = 64
+retention_days = 3650
+max_disk_gb = 20000
+min_free_disk_gb = 200
+queue_frames = 1048576
+
+[connection]
+# The venue caps a connection at 1024 streams; three streams a name ride each
+# of its two paths, so ~550 names are five connections a path at 400.
+topics_per_connection = 400
+
+[snapshots]
+cadence = "hour"
+
+# No [budget]: this configuration measures its bytes and sheds nothing.
+
+[[tier]]
+name = "core"
+feeds = ["book:1000"]
+universe = { kind = "top_turnover", top = 30, quote = "USDT" }
+
+[[tier]]
+name = "everything"
+feeds = [
+    "book:20",
+    "book:1",
+    "trades",
+    "ticker",
+    "liquidations",
+    "kline:1m",
+    "open_interest:60",
+    "funding",
+    "account_ratio",
+    "top_account_ratio",
+    "top_position_ratio",
+    "taker_volume",
+]
+universe = { kind = "listed", quote = "USDT" }

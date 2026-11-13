@@ -65,7 +65,10 @@ from market_tape.schema import (
     KIND_FUNDING,
     KIND_KLINE,
     KIND_LIQUIDATION,
+    KIND_TAKER_VOLUME,
     KIND_TICKER,
+    KIND_TOP_ACCOUNT_RATIO,
+    KIND_TOP_POSITION_RATIO,
     KIND_TRADE,
     SCHEMA_VERSION,
     SIDES,
@@ -129,7 +132,12 @@ KIND_CODES = {
     KIND_KLINE: 6,
     KIND_FUNDING: 7,
     KIND_ACCOUNT_RATIO: 8,
+    KIND_TOP_ACCOUNT_RATIO: 9,
+    KIND_TOP_POSITION_RATIO: 10,
+    KIND_TAKER_VOLUME: 11,
 }
+#: The kinds that share the account ratio's record: a bucket's long and short shares.
+RATIO_KINDS = (KIND_ACCOUNT_RATIO, KIND_TOP_ACCOUNT_RATIO, KIND_TOP_POSITION_RATIO)
 KIND_NAMES = {code: kind for kind, code in KIND_CODES.items()}
 
 FLAG_SNAPSHOT = 1
@@ -212,6 +220,9 @@ _FUNDING = np.dtype(_COMMON + [("funding_time_ms", "<i8"), ("funding_rate", "<f8
 _ACCOUNT_RATIO = np.dtype(
     _COMMON + [("ts_ms", "<i8"), ("buy_ratio", "<f8"), ("sell_ratio", "<f8"), ("period", "<u4")]
 )
+_TAKER_VOLUME = np.dtype(
+    _COMMON + [("ts_ms", "<i8"), ("buy_volume", "<f8"), ("sell_volume", "<f8"), ("period", "<u4")]
+)
 RECORD_DTYPES = {
     KIND_BOOK_SNAPSHOT: _BOOK,
     KIND_BOOK_DELTA: _BOOK,
@@ -221,6 +232,9 @@ RECORD_DTYPES = {
     KIND_KLINE: _KLINE,
     KIND_FUNDING: _FUNDING,
     KIND_ACCOUNT_RATIO: _ACCOUNT_RATIO,
+    KIND_TOP_ACCOUNT_RATIO: _ACCOUNT_RATIO,
+    KIND_TOP_POSITION_RATIO: _ACCOUNT_RATIO,
+    KIND_TAKER_VOLUME: _TAKER_VOLUME,
 }
 
 _COMMON_KEYS = {"kind", "venue", "symbol", "local_receive_ts_ns", "local_receive_mono_ns"}
@@ -262,8 +276,10 @@ KNOWN_KEYS = {
     },
     KIND_FUNDING: _COMMON_KEYS | {"funding_time_ms", "funding_rate"},
     KIND_ACCOUNT_RATIO: _COMMON_KEYS | {"period", "ts_ms", "buy_ratio", "sell_ratio"},
+    KIND_TAKER_VOLUME: _COMMON_KEYS | {"period", "ts_ms", "buy_volume", "sell_volume"},
 }
 KNOWN_KEYS[KIND_BOOK_DELTA] = KNOWN_KEYS[KIND_BOOK_SNAPSHOT]
+KNOWN_KEYS[KIND_TOP_ACCOUNT_RATIO] = KNOWN_KEYS[KIND_TOP_POSITION_RATIO] = KNOWN_KEYS[KIND_ACCOUNT_RATIO]
 
 
 class BlockError(RuntimeError):
@@ -496,13 +512,23 @@ def _encode_records(kind: str, rows: Sequence[tuple[int, Mapping[str, Any]]]) ->
             )
         elif kind == KIND_FUNDING:
             records.append(common + (_int(row, "funding_time_ms"), _float(row, "funding_rate")))
-        elif kind == KIND_ACCOUNT_RATIO:
+        elif kind in RATIO_KINDS:
             records.append(
                 common
                 + (
                     _int(row, "ts_ms"),
                     _float(row, "buy_ratio"),
                     _float(row, "sell_ratio"),
+                    strings.id(str(row.get("period") or "")),
+                )
+            )
+        elif kind == KIND_TAKER_VOLUME:
+            records.append(
+                common
+                + (
+                    _int(row, "ts_ms"),
+                    _float(row, "buy_volume"),
+                    _float(row, "sell_volume"),
                     strings.id(str(row.get("period") or "")),
                 )
             )
@@ -652,7 +678,8 @@ def _decode_records(kind: str, strings: list[str], records: np.ndarray, levels: 
                     },
                 )
             )
-    elif kind == KIND_ACCOUNT_RATIO:
+    elif kind in RATIO_KINDS or kind == KIND_TAKER_VOLUME:
+        buy_key, sell_key = ("buy_volume", "sell_volume") if kind == KIND_TAKER_VOLUME else ("buy_ratio", "sell_ratio")
         for seq, symbol, venue, received, mono, ts, buy, sell, period in records.tolist():
             out.append(
                 (
@@ -664,8 +691,8 @@ def _decode_records(kind: str, strings: list[str], records: np.ndarray, levels: 
                         "local_receive_ts_ns": received,
                         "period": strings[period],
                         "ts_ms": ts,
-                        "buy_ratio": buy,
-                        "sell_ratio": sell,
+                        buy_key: buy,
+                        sell_key: sell,
                     },
                 )
             )

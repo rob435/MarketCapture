@@ -12,7 +12,12 @@ thread that walks the universe once an hour a few minutes past the boundary
 the settlements fall on: `funding` reads `/v5/market/funding/history`, the
 settled payments, and `account_ratio` reads `/v5/market/account-ratio`, the
 long/short account ratio in five-minute buckets. Both dedupe on the venue's
-own stamps, so a row is written once however often it is fetched.
+own stamps, so a row is written once however often it is fetched; the walk
+is the one Binance's lane runs (`market_tape/venues/lanes.py`), and the
+stamps it dedupes on live on the adapter (`BybitAdapter.lane_state`), so a
+lane restarted on a universe change writes nothing twice. Binance's other
+lane feeds (`top_account_ratio`, `top_position_ratio`, `taker_volume`) have
+no Bybit history and are refused.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping
 
 from market_tape.config import ConfigError, Feed
@@ -38,6 +43,7 @@ from market_tape.schema import (
     typed_book_row,
 )
 from market_tape.venues import Emit
+from market_tape.venues.lanes import HourlyLane, LaneFeed, LaneState
 
 PUBLIC_LINEAR_WS = "wss://stream.bybit.com/v5/public/linear"
 PUBLIC_REST = "https://api.bybit.com"
@@ -74,6 +80,8 @@ TICKER_FIELDS = {
 }
 #: The feeds the REST lane serves: no stream carries them.
 LANE_FEEDS = ("funding", "account_ratio")
+#: Lane feeds Binance serves and Bybit has no history for.
+BINANCE_ONLY_FEEDS = ("top_account_ratio", "top_position_ratio", "taker_volume")
 #: The account-ratio bucket the lane asks for; the venue offers 5min upward.
 ACCOUNT_RATIO_PERIOD = "5min"
 #: Buckets one hourly pass reads: an hour of five-minute buckets, plus one so a
@@ -82,6 +90,12 @@ ACCOUNT_RATIO_LIMIT = 13
 #: Settlements one hourly pass reads: the newest, plus one for a symbol that
 #: settles hourly and a pass that ran late.
 FUNDING_HISTORY_LIMIT = 2
+#: A catch-up after a refused or late pass: the shortest spacing of each
+#: history's rows, and the venue's largest page of it.
+FUNDING_STEP_MS = 3_600_000
+FUNDING_HISTORY_MAX_LIMIT = 200
+ACCOUNT_RATIO_STEP_MS = 300_000
+ACCOUNT_RATIO_MAX_LIMIT = 500
 #: The lane runs once per interval, `LANE_OFFSET_SECONDS` past the boundary:
 #: settlements fall on the hour, and the venue's history lists them shortly
 #: after.
@@ -197,121 +211,86 @@ def account_ratio_rows(
     return rows
 
 
-@dataclass
-class RestLane:
-    """One thread polling the venue's REST history for the feeds no stream carries.
+class RestLane(HourlyLane):
+    """Bybit's two lane feeds on the shared hourly walk (`market_tape/venues/lanes.py`).
 
     Once an hour, `offset_seconds` past the boundary, it asks the venue for
     each symbol's settled funding and its long/short account ratio and hands
     every row it has not seen before to the writer through `emit`. The first
-    pass takes the newest settlement and the last hour of ratio buckets; every
-    later pass takes what is newer than the last stamp it saw. Requests are
-    paced so a whole universe is one slow walk rather than a burst; a symbol
-    the venue refuses is counted, logged once per pass, and left for the next
-    pass; nothing here can stop the tape.
+    fetch of a symbol takes the newest settlement and the last hour of ratio
+    buckets; every later one takes what is newer than the last stamp written,
+    which `state` keeps across lane restarts (the adapter owns it). Requests
+    are paced at `requests_per_second`; a symbol the venue refuses is counted,
+    logged once per pass, and left for the next pass; nothing here can stop
+    the tape.
     """
 
-    rest_url: str
-    market: str
-    emit: Emit
-    stop: threading.Event
-    funding_symbols: tuple[str, ...] = ()
-    ratio_symbols: tuple[str, ...] = ()
-    venue: str = "bybit"
-    period: str = ACCOUNT_RATIO_PERIOD
-    fetch_funding: Callable[[str, str, str, int], list[dict[str, Any]]] = fetch_funding_history
-    fetch_ratio: Callable[[str, str, str, str, int], list[dict[str, Any]]] = fetch_account_ratio
-    clock_ns: Callable[[], int] = time.time_ns
-    sleep: Callable[[float], None] = time.sleep
-    requests_per_second: float = LANE_REQUESTS_PER_SECOND
-    interval_seconds: float = LANE_INTERVAL_SECONDS
-    offset_seconds: float = LANE_OFFSET_SECONDS
-    last_funding_ms: dict[str, int] = field(default_factory=dict)
-    last_ratio_ms: dict[str, int] = field(default_factory=dict)
-    passes: int = 0
+    def __init__(
+        self,
+        *,
+        rest_url: str,
+        market: str,
+        emit: Emit,
+        stop: threading.Event,
+        funding_symbols: tuple[str, ...] = (),
+        ratio_symbols: tuple[str, ...] = (),
+        venue: str = "bybit",
+        period: str = ACCOUNT_RATIO_PERIOD,
+        fetch_funding: Callable[[str, str, str, int], list[dict[str, Any]]] = fetch_funding_history,
+        fetch_ratio: Callable[[str, str, str, str, int], list[dict[str, Any]]] = fetch_account_ratio,
+        state: LaneState | None = None,
+        clock_ns: Callable[[], int] = time.time_ns,
+        sleep: Callable[[float], object] | None = None,
+        requests_per_second: float = LANE_REQUESTS_PER_SECOND,
+        interval_seconds: float = LANE_INTERVAL_SECONDS,
+        offset_seconds: float = LANE_OFFSET_SECONDS,
+    ) -> None:
+        pause = 1.0 / requests_per_second if requests_per_second > 0 else 0.0
 
-    def thread(self) -> threading.Thread:
-        return threading.Thread(target=self.run, name="tape-lane-bybit-rest", daemon=True)
+        def funding(symbol: str, limit: int) -> tuple[list[dict[str, Any]], int | None]:
+            return fetch_funding(rest_url, market, symbol, limit), None
 
-    def run(self) -> None:
-        while not self.stop.is_set():
-            try:
-                self.pass_once()
-            except Exception:  # the lane outlives anything one pass meets
-                logging.exception("bybit rest lane pass failed")
-            self.stop.wait(self.seconds_until_next(self.clock_ns() / 1e9))
+        def ratio(symbol: str, limit: int) -> tuple[list[dict[str, Any]], int | None]:
+            return fetch_ratio(rest_url, market, symbol, period, limit), None
 
-    def seconds_until_next(self, now_s: float) -> float:
-        """Seconds to the next `offset_seconds` past an interval boundary."""
-
-        boundary = (now_s // self.interval_seconds) * self.interval_seconds + self.offset_seconds
-        if boundary <= now_s:
-            boundary += self.interval_seconds
-        return boundary - now_s
-
-    def pass_once(self) -> dict[str, int]:
-        """One walk of both universes; returns what it emitted and what failed."""
-
-        counts = {"funding": 0, "account_ratio": 0, "failures": 0}
-        first_error: str | None = None
-        pause = 1.0 / self.requests_per_second if self.requests_per_second > 0 else 0.0
-        for symbol in self.funding_symbols:
-            if self.stop.is_set():
-                return counts
-            try:
-                listed = self.fetch_funding(self.rest_url, self.market, symbol, FUNDING_HISTORY_LIMIT)
-            except Exception as exc:  # one refused symbol is the next pass's
-                counts["failures"] += 1
-                first_error = first_error or f"{symbol}: {exc}"
-            else:
-                # Stamped as the answer arrives: a stamp taken before the fetch
-                # sat behind every stream frame the fetch took.
-                received_ns = self.clock_ns()
-                seen = self.last_funding_ms.get(symbol)
-                rows = funding_rows(self.venue, symbol, listed, received_ns, after_ms=-1 if seen is None else seen)
-                if seen is None and rows:
-                    rows = rows[-1:]
-                for row in rows:
-                    self.emit(row)
-                    self.last_funding_ms[symbol] = int(row["funding_time_ms"])
-                counts["funding"] += len(rows)
-            if pause:
-                self.sleep(pause)
-        for symbol in self.ratio_symbols:
-            if self.stop.is_set():
-                return counts
-            try:
-                listed = self.fetch_ratio(self.rest_url, self.market, symbol, self.period, ACCOUNT_RATIO_LIMIT)
-            except Exception as exc:  # one refused symbol is the next pass's
-                counts["failures"] += 1
-                first_error = first_error or f"{symbol}: {exc}"
-            else:
-                received_ns = self.clock_ns()
-                seen = self.last_ratio_ms.get(symbol)
-                rows = account_ratio_rows(
-                    self.venue, symbol, self.period, listed, received_ns, after_ms=-1 if seen is None else seen
-                )
-                for row in rows:
-                    self.emit(row)
-                    self.last_ratio_ms[symbol] = int(row["ts_ms"])
-                counts["account_ratio"] += len(rows)
-            if pause:
-                self.sleep(pause)
-        self.passes += 1
-        if counts["failures"]:
-            logging.warning(
-                "bybit rest lane: %d of %d symbols refused this pass, first %s",
-                counts["failures"],
-                len(self.funding_symbols) + len(self.ratio_symbols),
-                first_error,
-            )
-        logging.info(
-            "bybit rest lane pass %d: %d funding settlements, %d account-ratio buckets",
-            self.passes,
-            counts["funding"],
-            counts["account_ratio"],
+        feeds = (
+            LaneFeed(
+                name="funding",
+                symbols=tuple(funding_symbols),
+                fetch=funding,
+                rows=lambda symbol, listed, received, after: funding_rows(venue, symbol, listed, received, after_ms=after),
+                stamp="funding_time_ms",
+                limit=FUNDING_HISTORY_LIMIT,
+                step_ms=FUNDING_STEP_MS,
+                max_limit=FUNDING_HISTORY_MAX_LIMIT,
+                pause=pause,
+                newest_only_first=True,
+            ),
+            LaneFeed(
+                name="account_ratio",
+                symbols=tuple(ratio_symbols),
+                fetch=ratio,
+                rows=lambda symbol, listed, received, after: account_ratio_rows(
+                    venue, symbol, period, listed, received, after_ms=after
+                ),
+                stamp="ts_ms",
+                limit=ACCOUNT_RATIO_LIMIT,
+                step_ms=ACCOUNT_RATIO_STEP_MS,
+                max_limit=ACCOUNT_RATIO_MAX_LIMIT,
+                pause=pause,
+            ),
         )
-        return counts
+        super().__init__(
+            venue=venue,
+            feeds=feeds,
+            emit=emit,
+            stop=stop,
+            state=state if state is not None else LaneState(),
+            clock_ns=clock_ns,
+            sleep=sleep,
+            interval_seconds=interval_seconds,
+            offset_seconds=offset_seconds,
+        )
 
 
 @dataclass(slots=True)
@@ -335,6 +314,8 @@ class BybitAdapter:
         self.sequences: dict[str, SequenceState] = {}
         #: Each book topic's depth, read from its name once.
         self.depths: dict[str, int] = {}
+        #: The REST lane's stamps and health: the adapter's, so they outlive a lane restart.
+        self.lane_state = LaneState()
 
     # ---------------------------------------------------------------- feeds
 
@@ -342,6 +323,10 @@ class BybitAdapter:
         for feed in feeds:
             if feed.name in LANE_FEEDS:
                 continue
+            if feed.name in BINANCE_ONLY_FEEDS:
+                raise ConfigError(
+                    f"Bybit publishes no {feed.name} history; its REST lane records {' and '.join(LANE_FEEDS)}"
+                )
             if feed.name == "book" and feed.levels not in BOOK_LEVELS:
                 raise ConfigError(f"Bybit offers book levels {BOOK_LEVELS}, not {feed.text}")
             if feed.name == "kline" and feed.arg not in KLINE_INTERVALS:
@@ -385,12 +370,16 @@ class BybitAdapter:
     def remove_messages(self, topics: list[str]) -> list[str]:
         return [json.dumps({"op": "unsubscribe", "args": topics[start : start + 10]}) for start in range(0, len(topics), 10)]
 
-    def start_lanes(self, feeds_by_symbol: Mapping[str, tuple[Feed, ...]], emit: Emit, stop: threading.Event) -> list[threading.Thread]:
+    def rest_lane(
+        self, feeds_by_symbol: Mapping[str, tuple[Feed, ...]], emit: Emit, stop: threading.Event
+    ) -> RestLane | None:
+        """The REST lane for the symbols that ask for a lane feed, not started; None when none does."""
+
         funding = tuple(sorted(symbol for symbol, feeds in feeds_by_symbol.items() if Feed("funding") in feeds))
         ratio = tuple(sorted(symbol for symbol, feeds in feeds_by_symbol.items() if Feed("account_ratio") in feeds))
         if not funding and not ratio:
-            return []
-        lane = RestLane(
+            return None
+        return RestLane(
             rest_url=self.rest_url,
             market=self.market,
             emit=emit,
@@ -398,10 +387,19 @@ class BybitAdapter:
             funding_symbols=funding,
             ratio_symbols=ratio,
             venue=self.name,
+            state=self.lane_state,
         )
+
+    def start_lanes(self, feeds_by_symbol: Mapping[str, tuple[Feed, ...]], emit: Emit, stop: threading.Event) -> list[threading.Thread]:
+        lane = self.rest_lane(feeds_by_symbol, emit, stop)
+        if lane is None:
+            return []
         thread = lane.thread()
         thread.start()
         return [thread]
+
+    def lane_status(self) -> dict[str, Any]:
+        return {"rest": self.lane_state.status()}
 
     # --------------------------------------------------------------- tables
 

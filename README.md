@@ -5,7 +5,7 @@ Records crypto-perpetual venues' public market data to an hourly tape on disk, s
 | Venue | Feeds (`market_tape/config.py` docstring) |
 | :--- | :--- |
 | Bybit linear | `book:1/50/200/500/1000` (snapshot and deltas, sequence-checked), `trades`, `ticker` (funding, open interest, mark, index, turnover), `liquidations`, `kline:<interval>`, and two hourly REST lanes, `funding` (settled payments) and `account_ratio` (long/short, 5 min) |
-| Binance USD-M | `book:1` (`bookTicker`), `book:5/10/20` (partial books), `book:1000` (the incremental L2 book: `depth@100ms` diffs, sequence-checked, with REST snapshots on every gap and every hour), `trades` (`@trade`), `ticker` (mark price and 24h), `liquidations`, `kline:<interval>`, `open_interest:<seconds>` (REST poll) |
+| Binance USD-M | `book:1` (`bookTicker`), `book:5/10/20` (partial books), `book:1000` (the incremental L2 book: `depth@100ms` diffs, sequence-checked, with REST snapshots on every gap and every hour), `trades` (`@trade`), `ticker` (mark price and 24h), `liquidations`, `kline:<interval>`, `open_interest:<seconds>` (REST poll), and five hourly REST lanes, `funding` (settled payments), `account_ratio`, `top_account_ratio`, `top_position_ratio` (long/short, 5 min) and `taker_volume` (taker buy and sell volume, 5 min) |
 
 What a tape holds:
 
