@@ -13,6 +13,7 @@ coverage    SOURCE --hours FROM[..TO] [...]      the coverage ledger: hour x sym
 quality     SOURCE --hours FROM[..TO] [...]      per hour, symbol and feed: rows, chaining, anchoring, clock skew
 blocks      SOURCE --hours FROM[..TO] --out ROOT  the hours as block files (segment-*.lmtb) under a new root
 index       PATH.lmtb [--blocks]                  a block file's index: kinds, groups, spans, bytes
+tardis      SOURCE --days FROM[..TO] --out ROOT   the days as Tardis-shaped day files (see `tardis --help`)
 metrics     --status [REALM=]PATH ... --state-dir DIR   one sample of each recorder's status to disk and the metrics sink
 ```
 
@@ -52,6 +53,7 @@ def main(argv: list[str] | None = None) -> int:
 
     commands.add_parser("pack", help="pack finished hours and upload them", add_help=False)
     commands.add_parser("fetch", help="range-read a plan's symbol-hours from the storage box", add_help=False)
+    commands.add_parser("tardis", help="export days as Tardis-shaped day files", add_help=False)
     commands.add_parser("metrics", help="sample each recorder's status once, to disk and the metrics sink", add_help=False)
 
     def source_arguments(command: argparse.ArgumentParser) -> None:
@@ -129,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if argv is None:
         argv = sys.argv[1:]
-    if argv and argv[0] in ("pack", "fetch", "metrics"):
+    if argv and argv[0] in ("pack", "fetch", "metrics", "tardis"):
         return int(importlib.import_module(f"market_tape.{argv[0]}").main(argv[1:]))
     args = parser.parse_args(argv)
 

@@ -38,7 +38,7 @@ python3 -m venv .venv
 | :--- | :--- |
 | none | `websockets`: record, pack, fetch, metrics |
 | `fast` | `orjson`, the recorder's JSON on its writer thread (`status.json` `fast_json`) |
-| `read` | `numpy`, `polars`, `google-crc32c`: bars, quality, block files, the rebuilt book |
+| `read` | `numpy`, `polars`, `google-crc32c`: bars, quality, block files, the rebuilt book (the `tardis` export needs none of them) |
 | `dev` | both, plus pytest, ruff, mypy |
 
 ## Quickstart
@@ -56,6 +56,27 @@ python3 -m venv .venv
 ```
 
 `market_tape/examples/binance-quickstart.toml` is the same for Binance. `market_tape/examples/bybit-full-universe.toml` records everything Bybit publishes for every listed USDT perpetual.
+
+## Research: `liquidity-migration`
+
+[`liquidity-migration`](https://github.com/rob435/liquidity-migration)'s research archive takes market data as Tardis.dev day files (`ec convert tardis`). `market-tape tardis` writes any source's days in that shape ([`market_tape/tardis.py`](market_tape/tardis.py): layout, columns, every rule), so a recorded day converts as a downloaded one does:
+
+```bash
+.venv/bin/market-tape tardis rclone:storagebox:market-tape/bybit-linear  --days 2026-10-02..2026-10-05 --out /data/tape-tardis --jobs 8
+.venv/bin/market-tape tardis rclone:storagebox:market-tape/binance-usdm --days 2026-10-02..2026-10-05 --out /data/tape-tardis --jobs 8
+ec convert tardis                 --root /data/tape-tardis --archive <archive> --from 2026-10-02 --to 2026-10-04 --metadata FILE
+ec convert tardis --venue binance --root /data/tape-tardis --archive <archive> --from 2026-10-02 --to 2026-10-04
+```
+
+| Tardis type | From | Notes |
+| :--- | :--- | :--- |
+| `incremental_book_L2` | `book:50` (Bybit), `book:1000` (Binance); `--book-depth` names another | Book levels keep the venue's own decimal text |
+| `book_ticker` | `book:1` | |
+| `trades` | `trades` | Bybit's trade ids kept; Binance's are `@trade`'s |
+| `derivative_ticker` | `ticker` (and Binance's `open_interest` poll) | |
+| `liquidations` | `liquidations` | Bybit's `allLiquidation` states every liquidation, Binance's stream one a symbol a second |
+
+`local_timestamp` is this recorder's kernel receive stamp on the capture host, so the archive's receive times are the host's own and need no re-stamping. A day is exported only once the source holds its 24 hours (`--allow-partial` exports what is there); a symbol-day already in `<out>/<exchange>/exports.jsonl` is skipped, so the command is safe to run daily over a sliding window.
 
 ## A capture host
 
