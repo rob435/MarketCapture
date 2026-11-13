@@ -53,6 +53,7 @@ python3 -m venv .venv
 .venv/bin/market-tape quality  ./tape --hours 2026-10-02T18
 .venv/bin/market-tape bars     ./tape --hours 2026-10-02T18 --interval 60 --out bars.parquet
 .venv/bin/market-tape book     ./tape --hour 2026-10-02T18 --symbol BTCUSDT
+.venv/bin/market-tape verify   ./tape --hours 2026-10-02T18 --rows   # every file against its receipt; also reads rclone:<remote>
 ```
 
 `market_tape/examples/binance-quickstart.toml` is the same for Binance. `market_tape/examples/binance-full-book.toml` records Binance's full incremental book for a few majors. `market_tape/examples/bybit-full-universe.toml` records everything Bybit publishes for every listed USDT perpetual.

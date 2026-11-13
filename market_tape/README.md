@@ -14,6 +14,7 @@ Records one venue's public market data per process, compresses it, ships hourly 
 | `pack` | `market_tape/pack.py` (hours, index, upload, box ledger, sliding window, recovery on an idle root) |
 | `fetch` | `market_tape/fetch.py` (plan, reads, statuses, writes, window, stdout) |
 | `blocks`, `index`, `rows --start-ns/--end-ns` | `market_tape/blocks.py` (§Block tape) |
+| `verify` | `market_tape/verify.py` (every file of the named hours against its receipt, on a root, an archive directory or the box: digest, missing, unreceipted, rows, order, coverage record; exit 1 on a failure) |
 | `tardis` | `market_tape/tardis.py` (Tardis-shaped day files: layout, columns, the book chain, restamping, resume); what `liquidity-migration`'s `ec convert tardis` reads |
 | `metrics` | `market_tape/metrics.py`; the `lm_recorder` line is pinned by `tests/market_tape/fixtures/recorder_metrics_oracle.json` |
 
