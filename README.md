@@ -23,6 +23,7 @@ Readers rebuild the book at any moment, cut bars, grade the rows' quality, range
 | Python 3.11+; Linux for a capture host | Everything; tested on Linux. There each receive stamp is the kernel's (`SO_TIMESTAMPNS`); elsewhere it is the read's |
 | `zstd` on `PATH` | Recording and reading: segments are compressed and read through the command line tool |
 | `rclone` | `pack`, `fetch`, and `rclone:` sources |
+| `ip` and `ss` (iproute2); root | `pack`'s best-effort transport help: BBR routes to the storage box and the watch for a crawling upload (`--no-bbr`, `--crawl-seconds`); without them uploads run as plain `rclone copyto` |
 | `chrony` (or another disciplined clock) | A capture host: the receive stamp's error is the host clock's ([`deploy/chrony.conf`](deploy/chrony.conf)) |
 | A host the venue serves | Bybit refuses some regions outright (HTTP 403 from its CDN); Binance's REST answers 451 from restricted regions while its streams still flow, so a `listed` universe there holds nothing and names must be given |
 
@@ -86,7 +87,7 @@ ec convert tardis --venue binance --root /data/tape-tardis --archive <archive> -
 | Unit (`deploy/systemd/`) | Cadence | Does |
 | :--- | :--- | :--- |
 | `market-capture-bybit.service`, `market-capture-binance.service` | continuous | `record`, root `/var/lib/market-capture/<tape>`; `MemoryMax` is twice the config's `queue_max_mb` |
-| `market-tape-pack.timer` | hourly at :10 | `pack` of both tapes to `storagebox:market-tape`, keeping 6 shipped hours locally; a tape with no root is skipped |
+| `market-tape-pack.timer` | hourly at :10 | `pack` of both tapes to `storagebox:market-tape`, keeping 6 shipped hours locally; a tape with no root is skipped. Each run routes the box with BBR before its first upload and restarts an upload whose connection crawls |
 | `market-tape-metrics.timer` | every minute | `metrics`: each `status.json` appended to `/var/lib/market-capture/metrics/` and pushed as line protocol when `/etc/market-capture/metrics.env` names a sink |
 
 ```bash

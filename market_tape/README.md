@@ -11,7 +11,7 @@ Records one venue's public market data per process, compresses it, ships hourly 
 | `record` | `market_tape/record.py` (processes, threads, module map); `market_tape/recorder/queue.py` (queue), `budget.py` (budget), `core.py` (lock, `_meta` and retention threads) |
 | `coverage` | `market_tape/coverage.py` (cell statuses, reason codes); the recorder's account of each hour |
 | `quality` | `market_tape/quality.py` (every column, the clock-step rule); the rows' own account |
-| `pack` | `market_tape/pack.py` (hours, index, upload, box ledger, sliding window, recovery on an idle root) |
+| `pack` | `market_tape/pack.py` (hours, index, upload, box ledger, sliding window, recovery on an idle root); `market_tape/boxroute.py` (BBR on the box's routes), `market_tape/crawl.py` (the watch for a crawling upload) |
 | `fetch` | `market_tape/fetch.py` (plan, reads, statuses, writes, window, stdout) |
 | `blocks`, `index`, `rows --start-ns/--end-ns` | `market_tape/blocks.py` (§Block tape) |
 | `verify` | `market_tape/verify.py` (every file of the named hours against its receipt, on a root, an archive directory or the box: digest, missing, unreceipted, rows, order, coverage record; exit 1 on a failure) |
@@ -86,6 +86,14 @@ Shared by `market_tape/venues/binance.py` (adapter and `DepthSnapshotLane`), `ma
 ### Storage box
 
 `<remote-base>/<tape>/YYYY/MM/DD/<day>T<HH>Z.tar` (any rclone remote that hashes; `deploy/rclone.conf.example`, installed at `/etc/market-capture/rclone.conf`; `--remote-base storagebox:market-tape` in `deploy/systemd/market-tape-pack.service`), tapes `bybit-linear` and `binance-usdm`, each tar beside its index `<day>T<HH>Z.tar.index.json` (`market_tape/pack.py::build_index`). Upload, proof and the box ledger: `market_tape/pack.py` docstring; only the current box's rows in `<state-dir>/uploaded-tapes.jsonl` license the sliding window's deletes.
+
+| `pack` flag | Default | Effect |
+| :--- | :--- | :--- |
+| `--no-bbr` | off | skips the host routes with `congctl bbr` to the box's addresses that a run sets before its first upload (best effort: root, `ip`; a failed step is said on stderr) |
+| `--crawl-seconds` | 30 | an upload whose connection held unsent bytes this long under `--crawl-floor-kibps` is stopped and goes again on a fresh connection, at most `MAX_STOPPED_ATTEMPTS` (3) times, then runs unwatched to the file's deadline; 0 watches nothing |
+| `--crawl-floor-kibps` | 100 | the pace in KiB/s the box must acknowledge a waiting connection's bytes at |
+
+The watch reads `ss -tinp` (iproute2); without it, or if it fails, uploads run unwatched and the run says so once.
 
 ### Fetch
 

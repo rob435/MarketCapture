@@ -21,6 +21,26 @@ whose segments are still on disk ships to it. An hour another box confirmed and
 the window has since emptied holds only its `_meta` here; its tape is on that
 box, and it is not packed again as if it were the whole hour.
 
+Before the first upload of a run (and only when something is pending and the
+run is not `--dry-run`) the box's addresses are routed with BBR congestion
+control (`market_tape/boxroute.py`, `--no-bbr` skips it). Each upload runs as
+a child in a session of its own and is watched for a crawl
+(`market_tape/crawl.py`): when a connection of it has held unsent bytes for
+`--crawl-seconds` (default 30) while the box acknowledged under
+`--crawl-floor-kibps` (default 100) KiB/s, the attempt is stopped, SIGTERM then
+SIGKILL, and the upload goes again on a fresh connection. rclone resumes
+nothing, so a stopped attempt starts over: after `MAX_STOPPED_ATTEMPTS` stops
+the next attempt is unwatched, and every attempt shares the file's one
+deadline. `--crawl-seconds 0` watches nothing.
+
+| Condition | Result |
+| --- | --- |
+| a connection crawls | one line says the pace and seconds; the upload goes again on a fresh connection, at most `MAX_STOPPED_ATTEMPTS` times |
+| an upload past those stops | runs unwatched, to its deadline |
+| the deadline (`max(RCLONE_TIMEOUT_SECONDS, size / UPLOAD_FLOOR_BYTES_PER_S)`) passes | the attempt and its processes are killed; the run fails as an rclone failure does; the hour stays unledgered and the next run packs it again |
+| `ss` not installed, or it fails | said once on stderr; uploads run unwatched |
+| the BBR step cannot run (not root, no `ip`, no `tcp_bbr`, host unresolved) | said on stderr; the upload goes on under the default congestion control |
+
 Several tapes ship in one run: `--tape NAME=ROOT` repeated, each landing under
 `--remote-base/NAME`. The single-tape form `--root ROOT --remote REMOTE` is the
 same thing with one tape.
@@ -65,8 +85,10 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import IO, Any, Iterable, Mapping, cast
+from typing import IO, Any, Callable, Iterable, Mapping, cast
 
+from market_tape import boxroute, crawl
+from market_tape.crawl import CrawlJudge, Watch
 from market_tape.storage import (
     ZSTD_TIMEOUT_SECONDS,
     Compressor,
@@ -92,6 +114,19 @@ RCLONE_TIMEOUT_SECONDS = 1800.0
 #: nothing of an upload it did not finish, and an hour that could not meet a
 #: fixed deadline would fail every run and stop every later hour behind it.
 UPLOAD_FLOOR_BYTES_PER_S = 100 * 1000
+#: How many attempts at one upload a crawl may stop (`market_tape/crawl.py`);
+#: the next one runs unwatched until the file's deadline. A stopped attempt
+#: loses everything it sent, rclone resuming nothing, and costs about the crawl
+#: window again; a fresh connection is a fresh draw, and a draw crawls again
+#: perhaps one time in three. Three stops are about a hundred seconds of an
+#: upload's deadline, which is at least RCLONE_TIMEOUT_SECONDS, and a line that
+#: is bad three connections running is more likely slow than unlucky, so past
+#: them the upload is let run to its deadline and a slow hour still lands
+#: rather than restarting for ever.
+MAX_STOPPED_ATTEMPTS = 3
+#: Defaults of `--crawl-seconds` and `--crawl-floor-kibps`.
+CRAWL_WINDOW_SECONDS = 30.0
+CRAWL_FLOOR_KIBPS = 100.0
 #: The index sidecar's suffix after the tar's own name, and its shape.
 INDEX_SUFFIX = ".index.json"
 INDEX_KIND = "market_tape_hour_index"
@@ -226,6 +261,16 @@ def finished_candidates(root: Path, *, now: float, grace_seconds: float) -> list
                 continue
             candidates.append(Candidate(f"{day}T{child.name}Z", day, child.name, (child,)))
     return candidates
+
+
+def box_field(config: Path, remote: str, key: str) -> str:
+    """One key of the rclone config section an rclone remote names, "" when
+    the section or the key is absent."""
+
+    parser = configparser.RawConfigParser()
+    parser.read(config, encoding="utf-8")
+    name = remote.split(":", 1)[0]
+    return parser[name].get(key, "") if parser.has_section(name) else ""
 
 
 def box_of(config: Path, remote: str) -> str:
@@ -529,9 +574,19 @@ def _shed_until(handle: IO[bytes], done: threading.Event) -> None:
 
 
 class Rclone:
-    def __init__(self, binary: str, config: Path) -> None:
+    def __init__(
+        self,
+        binary: str,
+        config: Path,
+        *,
+        watch: Watch = Watch(),
+        connections: Callable[[int], Mapping[str, crawl.Reading]] = crawl.connections,
+    ) -> None:
         self.binary = binary
         self.config = config
+        self.watch = watch
+        self._connections = connections
+        self._said_unwatched = False
 
     def run(
         self, *args: str, capture: bool = False, timeout: float = RCLONE_TIMEOUT_SECONDS
@@ -545,25 +600,97 @@ class Rclone:
         )
 
     def upload(self, local: Path, remote_path: str) -> None:
+        """`rclone copyto`, one deadline across every attempt; a crawling
+        connection stops an attempt and the upload goes again on a fresh one
+        (`market_tape/crawl.py`), `MAX_STOPPED_ATTEMPTS` times at most. The page
+        cache is shed while any attempt reads the file.
+
+        CalledProcessError when rclone fails, TimeoutExpired at the deadline."""
+
+        argv = [
+            self.binary,
+            "copyto",
+            str(local),
+            remote_path,
+            "--retries",
+            "5",
+            "--low-level-retries",
+            "10",
+            "--config",
+            str(self.config),
+        ]
+        timeout = max(RCLONE_TIMEOUT_SECONDS, local.stat().st_size / UPLOAD_FLOOR_BYTES_PER_S)
+        deadline = time.monotonic() + timeout
         with local.open("rb") as handle:
             done = threading.Event()
             shedder = threading.Thread(target=_shed_until, args=(handle, done), daemon=True)
             shedder.start()
             try:
-                self.run(
-                    "copyto",
-                    str(local),
-                    remote_path,
-                    "--retries",
-                    "5",
-                    "--low-level-retries",
-                    "10",
-                    timeout=max(RCLONE_TIMEOUT_SECONDS, local.stat().st_size / UPLOAD_FLOOR_BYTES_PER_S),
-                )
+                stopped = 0
+                while True:
+                    judged = self.watch.enabled and stopped < MAX_STOPPED_ATTEMPTS and self._can_watch()
+                    why = self._attempt(argv, deadline, timeout, CrawlJudge(self.watch) if judged else None)
+                    if why is None:
+                        return
+                    stopped += 1
+                    print(
+                        f"market tape: stopped the upload of {local.name} (attempt {stopped}): {why}; "
+                        "again on a fresh connection"
+                    )
             finally:
                 done.set()
                 shedder.join()
                 discard_file_cache(handle)
+
+    def _can_watch(self) -> bool:
+        if shutil.which("ss") is not None:
+            return True
+        self._unwatched("ss is not installed")
+        return False
+
+    def _unwatched(self, reason: str) -> None:
+        if not self._said_unwatched:
+            self._said_unwatched = True
+            print(f"market tape: {reason}; crawling uploads are not watched", file=sys.stderr, flush=True)
+
+    def _attempt(self, argv: list[str], deadline: float, timeout: float, judge: CrawlJudge | None) -> str | None:
+        """One rclone child in a session of its own, until it exits, the
+        deadline, or `judge` calls a crawl. None when it landed; why it was
+        stopped when a crawl stopped it."""
+
+        sys.stdout.flush()
+        child = subprocess.Popen(argv, start_new_session=True)
+        try:
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    crawl.stop(child)
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                look = self.watch.look_seconds if judge is not None else left
+                try:
+                    code = child.wait(timeout=min(look, left))
+                except subprocess.TimeoutExpired:
+                    pass
+                else:
+                    if code != 0:
+                        raise subprocess.CalledProcessError(code, argv)
+                    return None
+                if judge is None:
+                    continue
+                try:
+                    seen = self._connections(child.pid)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    self._unwatched(f"ss failed ({exc})")
+                    judge = None
+                    continue
+                why = judge.look(time.monotonic(), seen)
+                if why is not None:
+                    crawl.stop(child)
+                    return why
+        except BaseException:
+            if child.poll() is None:
+                crawl.stop(child)
+            raise
 
     def remote_listing(self, remote_dir: str, names: Iterable[str]) -> dict[str, tuple[str | None, int | None]]:
         """The named files in one remote directory: each one's MD5 as the remote computes it, and its size.
@@ -813,6 +940,23 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=24.0,
         help="local sliding window: a shipped hour's segments are deleted once it has been over this long",
     )
+    parser.add_argument(
+        "--crawl-seconds",
+        type=float,
+        default=CRAWL_WINDOW_SECONDS,
+        help="stop an upload whose connection has held unsent bytes this long under --crawl-floor-kibps; 0 watches nothing",
+    )
+    parser.add_argument(
+        "--crawl-floor-kibps",
+        type=float,
+        default=CRAWL_FLOOR_KIBPS,
+        help="the pace in KiB/s the box must acknowledge a waiting connection's bytes at, or it is a crawl",
+    )
+    parser.add_argument(
+        "--no-bbr",
+        action="store_true",
+        help="leave the routes to the box on the kernel's default congestion control",
+    )
     parser.add_argument("--rclone", default=os.environ.get("RCLONE_BIN") or "/usr/bin/rclone")
     parser.add_argument(
         "--config",
@@ -829,6 +973,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.keep_hours < 0:
         raise _usage_error(f"--keep-hours must be zero or more, got {args.keep_hours}")
+    if args.crawl_seconds < 0 or args.crawl_floor_kibps < 0:
+        raise _usage_error("--crawl-seconds and --crawl-floor-kibps must be zero or more")
     tapes = parse_tapes(args)
     present = [tape for tape in tapes if tape.root.is_dir()]
     for tape in tapes:
@@ -883,7 +1029,15 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if not args.config.exists():
             raise SystemExit(f"rclone config is missing: {args.config}")
-        rclone = Rclone(args.rclone, args.config)
+        if pending and not args.no_bbr:
+            # Once a run, before the first upload; each distinct box the tapes name.
+            for host in sorted({box_field(args.config, tape.remote, "host") for tape in present} - {""}):
+                boxroute.route_bbr(host)
+        rclone = Rclone(
+            args.rclone,
+            args.config,
+            watch=Watch(window=args.crawl_seconds, floor=args.crawl_floor_kibps * 1024),
+        )
         shipped: list[dict[str, Any]] = []
         for tape in present:
             shipped.extend(

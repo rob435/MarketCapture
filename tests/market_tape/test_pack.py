@@ -59,9 +59,16 @@ def _epoch(text: str) -> float:
 
 
 def _run(
-    tmp_path: Path, *tape_arguments: str, now: str, corrupt: bool | str = False, box: str = "u1.box.example"
+    tmp_path: Path,
+    *tape_arguments: str,
+    now: str,
+    corrupt: bool | str = False,
+    box: str = "u1.box.example",
+    flags: tuple[str, ...] = ("--no-bbr",),
+    env_extra: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """One pack run against `box`: a box of its own name keeps its own remote directory."""
+    """One pack run against `box`: a box of its own name keeps its own remote
+    directory. The box's routes are left alone (`--no-bbr`) unless `flags` say otherwise."""
 
     env = {
         **os.environ,
@@ -69,6 +76,7 @@ def _run(
         "FAKE_RCLONE_HASH_LOG": str(tmp_path / "hashed.log"),
         "FAKE_REMOTE_DIR": str(tmp_path / ("remote" if box == "u1.box.example" else f"remote-{box}")),
         "FAKE_RCLONE_CORRUPT": corrupt if isinstance(corrupt, str) else "1" if corrupt else "0",
+        **(env_extra or {}),
     }
     config = tmp_path / "rclone.conf"
     config.write_text(f"[storagebox]\ntype = sftp\nhost = {box}\nuser = u1\nport = 23\n", encoding="utf-8")
@@ -89,6 +97,7 @@ def _run(
             str(config),
             "--now",
             str(_epoch(now)),
+            *flags,
         ],
         cwd=ROOT,
         check=False,

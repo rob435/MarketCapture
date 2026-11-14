@@ -12,6 +12,13 @@ Group=root
 WorkingDirectory=/opt/market-capture
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=RCLONE_CONFIG=/etc/market-capture/rclone.conf
+# Root with the default capability set is also what the box's BBR routes need
+# (`ip route replace ... congctl bbr`: CAP_NET_ADMIN, an AF_NETLINK socket) and
+# what `ss -tinp` needs to name the sockets of the upload it watches; the unit
+# restricts neither, so nothing here denies them. Adding CapabilityBoundingSet=
+# or RestrictAddressFamilies= would need CAP_NET_ADMIN and AF_NETLINK kept. A
+# step that is denied is said on stderr and the upload goes on without it
+# (`--no-bbr` and `--crawl-seconds 0` switch them off).
 # One run ships every declared tape; a tape with no root yet is skipped.
 # --keep-hours is the local sliding window: a shipped hour's segments are
 # deleted from the recorder's root once it has been over this long. An hour
